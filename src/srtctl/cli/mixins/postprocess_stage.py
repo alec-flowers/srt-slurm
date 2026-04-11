@@ -151,10 +151,6 @@ class PostProcessStageMixin:
         Args:
             exit_code: Exit code from the benchmark run
         """
-        # Write lockfile with verification results (non-fatal — never blocks job completion)
-        verification = getattr(self, "_identity_verification", None)
-        write_lockfile(self.runtime.log_dir.parent, self.config, self.runtime.log_dir, verification=verification)
-
         # Copy config into log directory so it's included in S3 upload
         self._copy_config_to_logs()
 
@@ -163,6 +159,17 @@ class PostProcessStageMixin:
 
         # Extract benchmark results (reads rollup if available)
         benchmark_results = self._extract_benchmark_results()
+
+        # Write lockfile with verification + results (after rollup so results are included)
+        verification = getattr(self, "_identity_verification", None)
+        rollup_results = self._load_rollup_for_lockfile()
+        write_lockfile(
+            self.runtime.log_dir.parent,
+            self.config,
+            self.runtime.log_dir,
+            verification=verification,
+            results=rollup_results,
+        )
 
         # Run srtlog + S3 upload in single container (if S3 configured)
         parquet_path, s3_url = self._run_postprocess_container()
@@ -225,6 +232,16 @@ class PostProcessStageMixin:
         if benchmark_out.exists():
             return {"benchmark_type": "unknown", "raw_output": benchmark_out.read_text(errors="replace")}
 
+        return None
+
+    def _load_rollup_for_lockfile(self) -> dict[str, Any] | None:
+        """Load benchmark-rollup.json for inclusion in the lockfile."""
+        rollup_file = self.runtime.log_dir / "benchmark-rollup.json"
+        if rollup_file.exists():
+            try:
+                return json.loads(rollup_file.read_text())
+            except Exception as e:
+                logger.debug("Failed to load rollup for lockfile: %s", e)
         return None
 
     def _run_postprocess_container(self) -> tuple[Path | None, str | None]:

@@ -533,6 +533,11 @@ def load_config(path: Path | str) -> SrtConfig:
     with open(path) as f:
         user_config = yaml.safe_load(f)
 
+    # Strip lock: section if present (lockfiles are valid recipes)
+    lock_data = user_config.pop("lock", None)
+    if lock_data:
+        logger.info("Loaded lockfile — previous run data available for comparison")
+
     # Load cluster defaults (optional)
     cluster_config = load_cluster_config()
 
