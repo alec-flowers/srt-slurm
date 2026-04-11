@@ -534,9 +534,10 @@ def load_config(path: Path | str) -> SrtConfig:
         user_config = yaml.safe_load(f)
 
     # Strip lock: section if present (lockfiles are valid recipes)
+    # Preserved for comparison after the new run completes
     lock_data = user_config.pop("lock", None)
     if lock_data:
-        logger.info("Loaded lockfile — previous run data available for comparison")
+        logger.info("Loaded lockfile — will compare against previous run after benchmark")
 
     # Load cluster defaults (optional)
     cluster_config = load_cluster_config()
@@ -550,6 +551,8 @@ def load_config(path: Path | str) -> SrtConfig:
         config = schema.load(resolved_config)
         assert isinstance(config, SrtConfig)
         logger.info(f"Loaded config: {config.name}")
+        # Attach lock data from lockfile (if present) for post-run comparison
+        object.__setattr__(config, "_lock_data", lock_data)
         return config
     except Exception as e:
         raise ValueError(f"Invalid config in {path}: {e}") from e

@@ -28,7 +28,7 @@ import requests
 
 from srtctl.benchmarks.base import SCRIPTS_DIR
 from srtctl.core.config import load_cluster_config
-from srtctl.core.lockfile import write_lockfile
+from srtctl.core.lockfile import collect_worker_fingerprints, write_lockfile
 from srtctl.core.schema import AIAnalysisConfig, S3Config
 from srtctl.core.slurm import start_srun_process
 
@@ -171,6 +171,9 @@ class PostProcessStageMixin:
             results=rollup_results,
         )
 
+        # Compare against previous lockfile if this was a lockfile re-run
+        self._compare_against_previous_lock()
+
         # Run srtlog + S3 upload in single container (if S3 configured)
         parquet_path, s3_url = self._run_postprocess_container()
 
@@ -243,6 +246,68 @@ class PostProcessStageMixin:
             except Exception as e:
                 logger.debug("Failed to load rollup for lockfile: %s", e)
         return None
+
+    def _compare_against_previous_lock(self) -> None:
+        """If this run was from a lockfile, compare fingerprints and results against the previous run."""
+        try:
+            lock_data = getattr(self.config, "_lock_data", None)
+            if not lock_data:
+                return
+
+            prev_fps = lock_data.get("fingerprints")
+            prev_results = lock_data.get("results")
+            new_fps = collect_worker_fingerprints(self.runtime.log_dir)
+
+            if not prev_fps or not new_fps:
+                return
+
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info("Comparison against previous lockfile run")
+            logger.info("=" * 60)
+
+            # Compare fingerprints (environment equivalence)
+            prev_fp = next(iter(prev_fps.values()))
+            new_fp = next(iter(new_fps.values()))
+
+            # Compare key fields
+            for key in ["arch", "python_version", "cuda_version", "nccl_version"]:
+                prev_val = prev_fp.get(key, "?")
+                new_val = new_fp.get(key, "?")
+                status = "==" if prev_val == new_val else "!="
+                icon = "OK" if prev_val == new_val else "!!"
+                logger.info(f"  {icon}  {key}: {prev_val} {status} {new_val}")
+
+            # Compare frameworks
+            prev_fw = prev_fp.get("frameworks", {})
+            new_fw = new_fp.get("frameworks", {})
+            for name in sorted(set(prev_fw) | set(new_fw)):
+                prev_v = prev_fw.get(name, "missing")
+                new_v = new_fw.get(name, "missing")
+                status = "==" if prev_v == new_v else "!="
+                icon = "OK" if prev_v == new_v else "!!"
+                logger.info(f"  {icon}  {name}: {prev_v} {status} {new_v}")
+
+            # Compare results if both exist
+            new_rollup = self._load_rollup_for_lockfile()
+            if prev_results and new_rollup:
+                prev_runs = prev_results.get("runs", [])
+                new_runs = new_rollup.get("runs", [])
+                if prev_runs and new_runs:
+                    logger.info("")
+                    logger.info("Results:")
+                    for prev_run, new_run in zip(prev_runs, new_runs, strict=False):
+                        for metric in ["throughput_toks", "request_throughput", "ttft_mean_ms", "itl_mean_ms"]:
+                            prev_v = prev_run.get(metric)
+                            new_v = new_run.get(metric)
+                            if prev_v is not None and new_v is not None and prev_v != 0:
+                                pct = (new_v - prev_v) / prev_v * 100
+                                icon = "OK" if abs(pct) < 5 else "!!"
+                                logger.info(f"  {icon}  {metric}: {prev_v} -> {new_v} ({pct:+.1f}%)")
+
+            logger.info("=" * 60)
+        except Exception as e:
+            logger.debug("Lockfile comparison skipped: %s", e)
 
     def _run_postprocess_container(self) -> tuple[Path | None, str | None]:
         """Run srtlog and upload entire log directory to S3.
