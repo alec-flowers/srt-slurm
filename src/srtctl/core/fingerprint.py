@@ -668,6 +668,16 @@ def verify_identity(
                     )
                 )
 
+    # --- Container identity (recorded, not verified — Pyxis strips provenance) ---
+    if hasattr(identity, "container") and identity.container and identity.container.image:
+        results.append(
+            IdentityCheckResult(
+                "container.image",
+                True,
+                f"{identity.container.image} (declared, not verifiable at runtime)",
+            )
+        )
+
     # --- Framework versions ---
     fp_frameworks = fp.get("frameworks") or {}
     for name, expected_version in (identity.frameworks or {}).items():
