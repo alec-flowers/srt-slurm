@@ -149,15 +149,29 @@ def build_lock_section(
     # Build verification summary
     verification_dict = None
     if verification:
-        passes = [r for r in verification if r.passed]
+        verified = [r for r in verification if r.passed and "not verifiable" not in r.message]
+        declared = [r for r in verification if r.passed and "not verifiable" in r.message]
         fails = [r for r in verification if not r.passed]
+
+        def _status(r: Any) -> str:
+            if not r.passed:
+                return "FAIL"
+            return "DECLARED" if "not verifiable" in r.message else "OK"
+
+        parts = []
+        if verified:
+            parts.append(f"{len(verified)} verified")
+        if declared:
+            parts.append(f"{len(declared)} declared")
+        if fails:
+            parts.append(f"{len(fails)} FAILED")
+
         verification_dict = {
-            "result": "all OK" if not fails else f"{len(fails)} FAILED",
-            "passed": len(passes),
+            "result": ", ".join(parts),
+            "verified": len(verified),
+            "declared": len(declared),
             "failed": len(fails),
-            "checks": [
-                {"field": r.field, "status": "OK" if r.passed else "FAIL", "message": r.message} for r in verification
-            ],
+            "checks": [{"field": r.field, "status": _status(r), "message": r.message} for r in verification],
         }
 
     # Record what aliases resolved to

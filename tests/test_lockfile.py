@@ -187,7 +187,7 @@ class TestBuildLockSection:
         ]
         lock = build_lock_section(config, verification=checks)
 
-        assert lock["verification"]["passed"] == 1
+        assert lock["verification"]["verified"] == 1
         assert lock["verification"]["failed"] == 1
 
     def test_with_results(self):
