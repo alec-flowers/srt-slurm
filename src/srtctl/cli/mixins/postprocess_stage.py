@@ -276,7 +276,7 @@ class PostProcessStageMixin:
                 if key == "cuda_version" and isinstance(val, str) and "release" in val:
                     import re
 
-                    m = re.search(r"release ([\\d.]+)", val)
+                    m = re.search(r"release ([\d.]+)", val)
                     return m.group(1) if m else str(val)
                 if key == "nccl_version" and isinstance(val, str) and val.startswith("("):
                     return val.strip("()").replace(", ", ".")
