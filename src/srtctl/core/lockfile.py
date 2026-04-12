@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import getpass
+import hashlib
 import logging
 import os
 from datetime import datetime, timezone
@@ -224,6 +225,10 @@ def write_lockfile(
             results=results,
         )
 
+        # Compute integrity hash over the lock content (before adding the hash itself)
+        lock_content_yaml = yaml.dump(lock_data, default_flow_style=False, sort_keys=True)
+        lock_data["integrity"] = hashlib.sha256(lock_content_yaml.encode()).hexdigest()
+
         # Append lock section to recipe
         lock_yaml = yaml.dump({"lock": lock_data}, default_flow_style=False, sort_keys=False)
         lockfile_text = recipe_text.rstrip() + "\n" + _LOCK_COMMENT + lock_yaml
@@ -252,6 +257,26 @@ def _strip_lock_section(yaml_text: str) -> str:
             continue
         result.append(line)
     return "".join(result)
+
+
+def verify_lock_integrity(lock_data: dict[str, Any]) -> bool:
+    """Verify that a lock section hasn't been tampered with.
+
+    Recomputes the SHA256 hash over the lock content (excluding the integrity
+    field itself) and compares against the stored hash.
+
+    Returns True if the hash matches, False if tampered or no hash present.
+    """
+    stored_hash = lock_data.get("integrity")
+    if not stored_hash:
+        return False
+
+    # Recompute hash without the integrity field
+    check_data = {k: v for k, v in lock_data.items() if k != "integrity"}
+    content_yaml = yaml.dump(check_data, default_flow_style=False, sort_keys=True)
+    computed_hash = hashlib.sha256(content_yaml.encode()).hexdigest()
+
+    return computed_hash == stored_hash
 
 
 def load_lockfile_fingerprints(path: Path) -> dict[str, Any] | None:
