@@ -256,6 +256,182 @@ def write_lockfile(
         return False
 
 
+def generate_reproduction_report(
+    prev_lock: dict[str, Any],
+    new_fingerprints: dict[str, Any],
+    new_results: dict[str, Any] | None = None,
+) -> tuple[list[str], list[str], list[str]]:
+    """Compare a new run's fingerprints against a previous lockfile's data.
+
+    Args:
+        prev_lock: The lock: section from the previous lockfile.
+        new_fingerprints: Per-worker fingerprints from the new run.
+        new_results: Benchmark rollup from the new run (optional).
+
+    Returns:
+        Tuple of (summary_lines, report_lines, issues).
+        - summary_lines: short output for sweep log
+        - report_lines: full report for reproduction-report.txt
+        - issues: list of problems found
+    """
+    import re
+
+    prev_fps = prev_lock.get("fingerprints", {})
+    prev_results = prev_lock.get("results")
+    if not prev_fps or not new_fingerprints:
+        return [], ["No fingerprints available for comparison."], []
+
+    prev_fp = next(iter(prev_fps.values()))
+    new_fp = next(iter(new_fingerprints.values()))
+    report_lines: list[str] = []
+    summary_lines: list[str] = []
+    issues: list[str] = []
+
+    def _short(key: str, val: Any) -> str:
+        if key == "cuda_version" and isinstance(val, str) and "release" in val:
+            m = re.search(r"release ([\d.]+)", val)
+            return m.group(1) if m else str(val)
+        if key == "nccl_version" and isinstance(val, str) and val.startswith("("):
+            return val.strip("()").replace(", ", ".")
+        return str(val)
+
+    def _compare(key: str, prev_val: Any, new_val: Any) -> str:
+        prev_s = _short(key, prev_val) if prev_val else "?"
+        new_s = _short(key, new_val) if new_val else "?"
+        match = prev_s == new_s
+        icon = "OK" if match else "!!"
+        line = f"  {icon}  {key}: {prev_s} == {new_s}" if match else f"  {icon}  {key}: {prev_s} != {new_s}"
+        if not match:
+            issues.append(f"{key}: {prev_s} -> {new_s}")
+        return line
+
+    # --- Header ---
+    prev_job = prev_lock.get("slurm", {}).get("job_id", "?")
+    report_lines.append("=" * 70)
+    report_lines.append("Reproduction Report")
+    report_lines.append(f"Comparing against lockfile from job {prev_job}")
+    report_lines.append("=" * 70)
+    report_lines.append("")
+
+    # --- Hardware ---
+    prev_gpus = prev_fp.get("gpu", {})
+    new_gpus = new_fp.get("gpu", {})
+    prev_gpu_name = prev_gpus.get("gpus", [{}])[0].get("name", "?") if prev_gpus.get("gpus") else "?"
+    new_gpu_name = new_gpus.get("gpus", [{}])[0].get("name", "?") if new_gpus.get("gpus") else "?"
+    prev_gpu_count = len(prev_gpus.get("gpus", []))
+    new_gpu_count = len(new_gpus.get("gpus", []))
+
+    report_lines.append("Hardware:")
+    line = _compare("gpu", f"{prev_gpu_count}x {prev_gpu_name}", f"{new_gpu_count}x {new_gpu_name}")
+    summary_lines.append(line)
+    report_lines.append(line)
+    line = _compare("driver", prev_gpus.get("driver"), new_gpus.get("driver"))
+    summary_lines.append(line)
+    report_lines.append(line)
+
+    # --- Environment ---
+    report_lines.append("")
+    report_lines.append("Environment:")
+    for key in ["arch", "python_version", "cuda_version", "nccl_version", "os"]:
+        line = _compare(key, prev_fp.get(key), new_fp.get(key))
+        summary_lines.append(line)
+        report_lines.append(line)
+
+    # --- Frameworks ---
+    report_lines.append("")
+    report_lines.append("Frameworks:")
+    prev_fw = prev_fp.get("frameworks", {})
+    new_fw = new_fp.get("frameworks", {})
+    for name in sorted(set(prev_fw) | set(new_fw)):
+        line = _compare(name, prev_fw.get(name), new_fw.get(name))
+        summary_lines.append(line)
+        report_lines.append(line)
+
+    # --- Results ---
+    if prev_results and new_results:
+        prev_runs = prev_results.get("runs", [])
+        new_runs = new_results.get("runs", [])
+        if prev_runs and new_runs:
+            report_lines.append("")
+            report_lines.append("Results:")
+            for prev_run, new_run in zip(prev_runs, new_runs, strict=False):
+                for metric in [
+                    "throughput_toks",
+                    "request_throughput",
+                    "ttft_mean_ms",
+                    "ttft_p99_ms",
+                    "itl_mean_ms",
+                    "itl_p99_ms",
+                    "e2el_mean_ms",
+                ]:
+                    prev_v = prev_run.get(metric)
+                    new_v = new_run.get(metric)
+                    if prev_v is not None and new_v is not None and prev_v != 0:
+                        pct = (new_v - prev_v) / prev_v * 100
+                        icon = "OK" if abs(pct) < 5 else "!!"
+                        line = f"  {icon}  {metric}: {prev_v} -> {new_v} ({pct:+.1f}%)"
+                        summary_lines.append(line)
+                        report_lines.append(line)
+                        if abs(pct) >= 5:
+                            issues.append(f"{metric}: {prev_v} -> {new_v} ({pct:+.1f}%)")
+
+    # --- Env vars (report only) ---
+    prev_env = prev_fp.get("env", {})
+    new_env = new_fp.get("env", {})
+    all_env_keys = sorted(set(prev_env) | set(new_env))
+    env_diffs = []
+    for k in all_env_keys:
+        if prev_env.get(k) != new_env.get(k):
+            env_diffs.append(f"  !!  {k}: {prev_env.get(k)} -> {new_env.get(k)}")
+    report_lines.append("")
+    report_lines.append(f"Environment Variables: {len(all_env_keys)} compared, {len(env_diffs)} differ")
+    if env_diffs:
+        report_lines.extend(env_diffs)
+    else:
+        report_lines.append("  All match.")
+
+    # --- Pip packages (report only) ---
+    from srtctl.core.fingerprint import _parse_pip_packages
+
+    prev_pkgs = _parse_pip_packages(prev_fp.get("pip_packages", {}))
+    new_pkgs = _parse_pip_packages(new_fp.get("pip_packages", {}))
+    all_pkg_names = sorted(set(prev_pkgs) | set(new_pkgs))
+    pkg_added, pkg_removed, pkg_changed, pkg_matched = [], [], [], 0
+    for name in all_pkg_names:
+        pv = prev_pkgs.get(name)
+        nv = new_pkgs.get(name)
+        if pv and nv and pv == nv:
+            pkg_matched += 1
+        elif pv and nv:
+            pkg_changed.append(f"  !!  {name}: {pv} -> {nv}")
+        elif pv:
+            pkg_removed.append(f"  --  {name}: {pv} (removed)")
+        else:
+            pkg_added.append(f"  ++  {name}: {nv} (added)")
+
+    report_lines.append("")
+    report_lines.append(
+        f"Pip Packages: {pkg_matched} match, {len(pkg_changed)} changed, "
+        f"{len(pkg_added)} added, {len(pkg_removed)} removed"
+    )
+    report_lines.extend(pkg_changed)
+    report_lines.extend(pkg_added)
+    report_lines.extend(pkg_removed)
+
+    # --- Summary ---
+    report_lines.append("")
+    report_lines.append("=" * 70)
+    if issues:
+        report_lines.append(f"ISSUES FOUND: {len(issues)}")
+        for issue in issues:
+            report_lines.append(f"  - {issue}")
+    else:
+        report_lines.append("No issues found. Environment is equivalent to the original run.")
+    report_lines.append("=" * 70)
+
+    return summary_lines, report_lines, issues
+
+
 def _strip_lock_section(yaml_text: str) -> str:
     """Remove an existing lock: section from YAML text."""
     lines = yaml_text.splitlines(keepends=True)

@@ -407,3 +407,131 @@ class TestLoadLockfileFingerprints:
 
         fps = load_lockfile_fingerprints(lockfile)
         assert fps["worker"]["hostname"] == "old-node"
+
+
+# ============================================================================
+# Reproduction report
+# ============================================================================
+
+
+class TestReproductionReport:
+    """Visual tests for generate_reproduction_report — prints output so you can see it."""
+
+    def test_identical_environments(self, capsys):
+        """Two identical runs — everything should match."""
+        from srtctl.core.lockfile import generate_reproduction_report
+
+        fp = {
+            "hostname": "node-001",
+            "arch": "aarch64",
+            "os": "Ubuntu 24.04.3 LTS",
+            "python_version": "3.12.3",
+            "cuda_version": "Cuda compilation tools, release 13.1, V13.1.80",
+            "nccl_version": "(2, 28, 9)",
+            "gpu": {"available": True, "driver": "580.126.16", "gpus": [
+                {"name": "NVIDIA GB200", "driver": "580.126.16", "memory": "189471 MiB"},
+                {"name": "NVIDIA GB200", "driver": "580.126.16", "memory": "189471 MiB"},
+                {"name": "NVIDIA GB200", "driver": "580.126.16", "memory": "189471 MiB"},
+                {"name": "NVIDIA GB200", "driver": "580.126.16", "memory": "189471 MiB"},
+            ]},
+            "frameworks": {"dynamo": "1.0.0", "tensorrt_llm": "1.3.0rc9"},
+            "env": {"CUDA_VERSION": "13.1.0.036", "NCCL_VERSION": "2.28.9"},
+            "pip_packages": {"python3": ["torch==2.10.0", "numpy==2.4.4", "ai-dynamo==1.0.0"]},
+        }
+        prev_lock = {"slurm": {"job_id": "1234"}, "fingerprints": {"agg_w0": fp}}
+
+        summary, report, issues = generate_reproduction_report(prev_lock, {"agg_w0": fp})
+
+        print("\n=== IDENTICAL ENVIRONMENTS ===")
+        for line in report:
+            print(line)
+
+        assert len(issues) == 0
+        assert any("No issues found" in line for line in report)
+        assert any("280" not in line or "match" in line for line in report)
+
+    def test_different_gpu_and_framework(self, capsys):
+        """Reproducer has different GPU and framework version — should flag issues."""
+        from srtctl.core.lockfile import generate_reproduction_report
+
+        prev_fp = {
+            "hostname": "lyris-001",
+            "arch": "aarch64",
+            "os": "Ubuntu 24.04.3 LTS",
+            "python_version": "3.12.3",
+            "cuda_version": "Cuda compilation tools, release 13.1, V13.1.80",
+            "nccl_version": "(2, 28, 9)",
+            "gpu": {"available": True, "driver": "580.126.16", "gpus": [
+                {"name": "NVIDIA GB200", "driver": "580.126.16", "memory": "189471 MiB"},
+                {"name": "NVIDIA GB200", "driver": "580.126.16", "memory": "189471 MiB"},
+                {"name": "NVIDIA GB200", "driver": "580.126.16", "memory": "189471 MiB"},
+                {"name": "NVIDIA GB200", "driver": "580.126.16", "memory": "189471 MiB"},
+            ]},
+            "frameworks": {"dynamo": "1.0.0", "tensorrt_llm": "1.3.0rc9"},
+            "env": {"CUDA_VERSION": "13.1.0.036", "NCCL_VERSION": "2.28.9"},
+            "pip_packages": {"python3": ["torch==2.10.0", "numpy==2.4.4", "ai-dynamo==1.0.0"]},
+        }
+        new_fp = {
+            "hostname": "computelab-042",
+            "arch": "x86_64",
+            "os": "Ubuntu 22.04.5 LTS",
+            "python_version": "3.12.3",
+            "cuda_version": "Cuda compilation tools, release 12.8, V12.8.93",
+            "nccl_version": "(2, 25, 1)",
+            "gpu": {"available": True, "driver": "570.86.15", "gpus": [
+                {"name": "NVIDIA H100", "driver": "570.86.15", "memory": "81559 MiB"},
+                {"name": "NVIDIA H100", "driver": "570.86.15", "memory": "81559 MiB"},
+                {"name": "NVIDIA H100", "driver": "570.86.15", "memory": "81559 MiB"},
+                {"name": "NVIDIA H100", "driver": "570.86.15", "memory": "81559 MiB"},
+                {"name": "NVIDIA H100", "driver": "570.86.15", "memory": "81559 MiB"},
+                {"name": "NVIDIA H100", "driver": "570.86.15", "memory": "81559 MiB"},
+                {"name": "NVIDIA H100", "driver": "570.86.15", "memory": "81559 MiB"},
+                {"name": "NVIDIA H100", "driver": "570.86.15", "memory": "81559 MiB"},
+            ]},
+            "frameworks": {"dynamo": "0.8.1", "tensorrt_llm": "1.2.0"},
+            "env": {"CUDA_VERSION": "12.8.0", "NCCL_VERSION": "2.25.1"},
+            "pip_packages": {"python3": ["torch==2.6.0", "numpy==2.4.4", "ai-dynamo==0.8.1", "vllm==0.8.0"]},
+        }
+        prev_lock = {"slurm": {"job_id": "9999"}, "fingerprints": {"agg_w0": prev_fp}}
+
+        summary, report, issues = generate_reproduction_report(prev_lock, {"agg_w0": new_fp})
+
+        print("\n=== DIFFERENT GPU + FRAMEWORK ===")
+        for line in report:
+            print(line)
+
+        assert len(issues) > 0
+        assert any("gpu" in issue for issue in issues)
+        assert any("dynamo" in issue for issue in issues)
+        assert any("ISSUES FOUND" in line for line in report)
+
+    def test_with_result_regression(self, capsys):
+        """Same environment but throughput regression — should flag results."""
+        from srtctl.core.lockfile import generate_reproduction_report
+
+        fp = {
+            "hostname": "node-001",
+            "arch": "aarch64",
+            "os": "Ubuntu 24.04.3 LTS",
+            "python_version": "3.12.3",
+            "cuda_version": "13.1",
+            "nccl_version": "2.28.9",
+            "gpu": {"available": True, "driver": "580.126.16", "gpus": [
+                {"name": "NVIDIA GB200", "driver": "580.126.16", "memory": "189471 MiB"},
+            ]},
+            "frameworks": {"dynamo": "1.0.0"},
+            "env": {},
+            "pip_packages": {},
+        }
+        prev_results = {"runs": [{"concurrency": 4, "throughput_toks": 12500, "ttft_mean_ms": 42.3, "itl_mean_ms": 3.1}]}
+        new_results = {"runs": [{"concurrency": 4, "throughput_toks": 11000, "ttft_mean_ms": 48.0, "itl_mean_ms": 3.2}]}
+        prev_lock = {"slurm": {"job_id": "5555"}, "fingerprints": {"w0": fp}, "results": prev_results}
+
+        summary, report, issues = generate_reproduction_report(prev_lock, {"w0": fp}, new_results)
+
+        print("\n=== RESULT REGRESSION ===")
+        for line in report:
+            print(line)
+
+        assert any("throughput" in issue for issue in issues)
+        assert any("ttft" in issue for issue in issues)

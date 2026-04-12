@@ -28,7 +28,7 @@ import requests
 
 from srtctl.benchmarks.base import SCRIPTS_DIR
 from srtctl.core.config import load_cluster_config
-from srtctl.core.lockfile import collect_worker_fingerprints, write_lockfile
+from srtctl.core.lockfile import collect_worker_fingerprints, generate_reproduction_report, write_lockfile
 from srtctl.core.schema import AIAnalysisConfig, S3Config
 from srtctl.core.slurm import start_srun_process
 
@@ -248,187 +248,38 @@ class PostProcessStageMixin:
         return None
 
     def _compare_against_previous_lock(self) -> None:
-        """If this run was from a lockfile, compare fingerprints and results against the previous run.
-
-        Writes two outputs:
-        1. Summary to sweep log (key fields, frameworks, results)
-        2. Full report to reproduction-report.txt (includes pip packages, env vars)
-        """
+        """If this run was from a lockfile, compare against previous run."""
         try:
             lock_data = getattr(self.config, "_lock_data", None)
             if not lock_data:
                 return
 
-            prev_fps = lock_data.get("fingerprints")
-            prev_results = lock_data.get("results")
             new_fps = collect_worker_fingerprints(self.runtime.log_dir)
-
-            if not prev_fps or not new_fps:
+            if not new_fps:
                 return
 
-            prev_fp = next(iter(prev_fps.values()))
-            new_fp = next(iter(new_fps.values()))
-            report_lines: list[str] = []
-            issues: list[str] = []
-
-            def _short(key: str, val: Any) -> str:
-                """Shorten verbose values for display."""
-                if key == "cuda_version" and isinstance(val, str) and "release" in val:
-                    import re
-
-                    m = re.search(r"release ([\d.]+)", val)
-                    return m.group(1) if m else str(val)
-                if key == "nccl_version" and isinstance(val, str) and val.startswith("("):
-                    return val.strip("()").replace(", ", ".")
-                return str(val)
-
-            def _compare_field(key: str, prev_val: Any, new_val: Any) -> str:
-                prev_s = _short(key, prev_val) if prev_val else "?"
-                new_s = _short(key, new_val) if new_val else "?"
-                match = prev_s == new_s
-                icon = "OK" if match else "!!"
-                line = f"  {icon}  {key}: {prev_s} == {new_s}" if match else f"  {icon}  {key}: {prev_s} != {new_s}"
-                if not match:
-                    issues.append(f"{key}: {prev_s} -> {new_s}")
-                return line
-
-            # --- Header ---
-            report_lines.append("=" * 70)
-            report_lines.append("Reproduction Report")
-            report_lines.append(f"Comparing against lockfile from job {lock_data.get('slurm', {}).get('job_id', '?')}")
-            report_lines.append("=" * 70)
-            report_lines.append("")
-
-            # --- GPU summary ---
-            prev_gpus = prev_fp.get("gpu", {})
-            new_gpus = new_fp.get("gpu", {})
-            prev_gpu_name = prev_gpus.get("gpus", [{}])[0].get("name", "?") if prev_gpus.get("gpus") else "?"
-            new_gpu_name = new_gpus.get("gpus", [{}])[0].get("name", "?") if new_gpus.get("gpus") else "?"
-            prev_gpu_count = len(prev_gpus.get("gpus", []))
-            new_gpu_count = len(new_gpus.get("gpus", []))
-            prev_driver = prev_gpus.get("driver", "?")
-            new_driver = new_gpus.get("driver", "?")
-
-            # --- Environment summary (also logged to sweep log) ---
-            report_lines.append("Hardware:")
-            summary_lines: list[str] = []
-            line = _compare_field("gpu", f"{prev_gpu_count}x {prev_gpu_name}", f"{new_gpu_count}x {new_gpu_name}")
-            summary_lines.append(line)
-            report_lines.append(line)
-            line = _compare_field("driver", prev_driver, new_driver)
-            summary_lines.append(line)
-            report_lines.append(line)
-
-            report_lines.append("")
-            report_lines.append("Environment:")
-            for key in ["arch", "python_version", "cuda_version", "nccl_version", "os"]:
-                line = _compare_field(key, prev_fp.get(key), new_fp.get(key))
-                summary_lines.append(line)
-                report_lines.append(line)
-
-            # Frameworks
-            report_lines.append("")
-            report_lines.append("Frameworks:")
-            prev_fw = prev_fp.get("frameworks", {})
-            new_fw = new_fp.get("frameworks", {})
-            for name in sorted(set(prev_fw) | set(new_fw)):
-                line = _compare_field(name, prev_fw.get(name), new_fw.get(name))
-                summary_lines.append(line)
-                report_lines.append(line)
+            new_rollup = self._load_rollup_for_lockfile()
+            summary_lines, report_lines, issues = generate_reproduction_report(
+                lock_data,
+                new_fps,
+                new_rollup,
+            )
 
             # Log summary to sweep log
-            logger.info("")
-            logger.info("=" * 60)
-            logger.info("Comparison against previous lockfile run")
-            logger.info("=" * 60)
-            for line in summary_lines:
-                logger.info(line)
+            if summary_lines:
+                logger.info("")
+                logger.info("=" * 60)
+                logger.info("Comparison against previous lockfile run")
+                logger.info("=" * 60)
+                for line in summary_lines:
+                    logger.info(line)
+                logger.info("=" * 60)
 
-            # --- Results (also logged to sweep log) ---
-            new_rollup = self._load_rollup_for_lockfile()
-            if prev_results and new_rollup:
-                prev_runs = prev_results.get("runs", [])
-                new_runs = new_rollup.get("runs", [])
-                if prev_runs and new_runs:
-                    report_lines.append("")
-                    report_lines.append("Results:")
-                    logger.info("")
-                    logger.info("Results:")
-                    for prev_run, new_run in zip(prev_runs, new_runs, strict=False):
-                        for metric in ["throughput_toks", "request_throughput", "ttft_mean_ms", "itl_mean_ms"]:
-                            prev_v = prev_run.get(metric)
-                            new_v = new_run.get(metric)
-                            if prev_v is not None and new_v is not None and prev_v != 0:
-                                pct = (new_v - prev_v) / prev_v * 100
-                                icon = "OK" if abs(pct) < 5 else "!!"
-                                line = f"  {icon}  {metric}: {prev_v} -> {new_v} ({pct:+.1f}%)"
-                                report_lines.append(line)
-                                logger.info(line)
-                                if abs(pct) >= 5:
-                                    issues.append(f"{metric}: {prev_v} -> {new_v} ({pct:+.1f}%)")
-
-            logger.info("=" * 60)
-
-            # --- Full env var diff (report only) ---
-            prev_env = prev_fp.get("env", {})
-            new_env = new_fp.get("env", {})
-            all_env_keys = sorted(set(prev_env) | set(new_env))
-            env_diffs = []
-            for k in all_env_keys:
-                pv = prev_env.get(k)
-                nv = new_env.get(k)
-                if pv != nv:
-                    env_diffs.append(f"  !!  {k}: {pv} -> {nv}")
-            report_lines.append("")
-            report_lines.append(f"Environment Variables: {len(all_env_keys)} compared, {len(env_diffs)} differ")
-            if env_diffs:
-                report_lines.extend(env_diffs)
-            else:
-                report_lines.append("  All match.")
-
-            # --- Full pip package diff (report only) ---
-            from srtctl.core.fingerprint import _parse_pip_packages
-
-            prev_pkgs = _parse_pip_packages(prev_fp.get("pip_packages", {}))
-            new_pkgs = _parse_pip_packages(new_fp.get("pip_packages", {}))
-            all_pkg_names = sorted(set(prev_pkgs) | set(new_pkgs))
-            pkg_added, pkg_removed, pkg_changed, pkg_matched = [], [], [], 0
-            for name in all_pkg_names:
-                pv = prev_pkgs.get(name)
-                nv = new_pkgs.get(name)
-                if pv and nv and pv == nv:
-                    pkg_matched += 1
-                elif pv and nv:
-                    pkg_changed.append(f"  !!  {name}: {pv} -> {nv}")
-                elif pv:
-                    pkg_removed.append(f"  --  {name}: {pv} (removed)")
-                else:
-                    pkg_added.append(f"  ++  {name}: {nv} (added)")
-
-            report_lines.append("")
-            report_lines.append(
-                f"Pip Packages: {pkg_matched} match, {len(pkg_changed)} changed, "
-                f"{len(pkg_added)} added, {len(pkg_removed)} removed"
-            )
-            report_lines.extend(pkg_changed)
-            report_lines.extend(pkg_added)
-            report_lines.extend(pkg_removed)
-
-            # --- Summary ---
-            report_lines.append("")
-            report_lines.append("=" * 70)
-            if issues:
-                report_lines.append(f"ISSUES FOUND: {len(issues)}")
-                for issue in issues:
-                    report_lines.append(f"  - {issue}")
-            else:
-                report_lines.append("No issues found. Environment is equivalent to the original run.")
-            report_lines.append("=" * 70)
-
-            # Write report file
-            report_path = self.runtime.log_dir / "reproduction-report.txt"
-            report_path.write_text("\n".join(report_lines) + "\n")
-            logger.info(f"Reproduction report: {report_path}")
+            # Write full report to file
+            if report_lines:
+                report_path = self.runtime.log_dir / "reproduction-report.txt"
+                report_path.write_text("\n".join(report_lines) + "\n")
+                logger.info(f"Reproduction report: {report_path}")
 
         except Exception as e:
             logger.debug("Lockfile comparison skipped: %s", e)
