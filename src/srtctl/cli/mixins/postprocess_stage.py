@@ -299,10 +299,29 @@ class PostProcessStageMixin:
             report_lines.append("=" * 70)
             report_lines.append("")
 
+            # --- GPU summary ---
+            prev_gpus = prev_fp.get("gpu", {})
+            new_gpus = new_fp.get("gpu", {})
+            prev_gpu_name = prev_gpus.get("gpus", [{}])[0].get("name", "?") if prev_gpus.get("gpus") else "?"
+            new_gpu_name = new_gpus.get("gpus", [{}])[0].get("name", "?") if new_gpus.get("gpus") else "?"
+            prev_gpu_count = len(prev_gpus.get("gpus", []))
+            new_gpu_count = len(new_gpus.get("gpus", []))
+            prev_driver = prev_gpus.get("driver", "?")
+            new_driver = new_gpus.get("driver", "?")
+
             # --- Environment summary (also logged to sweep log) ---
-            report_lines.append("Environment:")
+            report_lines.append("Hardware:")
             summary_lines: list[str] = []
-            for key in ["arch", "python_version", "cuda_version", "nccl_version"]:
+            line = _compare_field("gpu", f"{prev_gpu_count}x {prev_gpu_name}", f"{new_gpu_count}x {new_gpu_name}")
+            summary_lines.append(line)
+            report_lines.append(line)
+            line = _compare_field("driver", prev_driver, new_driver)
+            summary_lines.append(line)
+            report_lines.append(line)
+
+            report_lines.append("")
+            report_lines.append("Environment:")
+            for key in ["arch", "python_version", "cuda_version", "nccl_version", "os"]:
                 line = _compare_field(key, prev_fp.get(key), new_fp.get(key))
                 summary_lines.append(line)
                 report_lines.append(line)
