@@ -1,0 +1,73 @@
+# Qwen3-0.6B Conditional Prefill — 1 prefill + 1 decode on 2x H100 GPUs
+# Decode worker uses prefill_decode mode so it can handle both
+# disaggregated requests (from prefill) and aggregated requests
+# (when the router skips prefill for short prompts).
+
+name: qwen3-0.6b-condp-1p1d
+
+model:
+  path: "Qwen/Qwen3-0.6B"
+  container: "nvcr.io/nvidian/dynamo-dev/karenc:dynamo-1.0.1-21b444-trt-1.3.0rc11-condp"
+  precision: bf16
+
+resources:
+  gpu_type: h100
+  gpus_per_node: 8
+  prefill_nodes: 1
+  decode_nodes: 0
+  prefill_workers: 1
+  decode_workers: 1
+  gpus_per_prefill: 1
+  gpus_per_decode: 1
+
+frontend:
+  type: dynamo
+  enable_multiple_frontends: false
+  args:
+    router-mode: kv
+    conditional-prefill-max-isl: 128
+
+backend:
+  type: trtllm
+  conditional_prefill: true
+  trtllm_config:
+    prefill:
+      tensor_parallel_size: 1
+      moe_expert_parallel_size: 1
+      enable_attention_dp: false
+      max_num_tokens: 8192
+      trust_remote_code: true
+      backend: pytorch
+      enable_chunked_prefill: true
+      disable_overlap_scheduler: true
+      cuda_graph_config:
+        max_batch_size: 16
+      kv_cache_config:
+        free_gpu_memory_fraction: 0.85
+      cache_transceiver_config:
+        backend: DEFAULT
+    decode:
+      tensor_parallel_size: 1
+      moe_expert_parallel_size: 1
+      enable_attention_dp: false
+      max_num_tokens: 8192
+      trust_remote_code: true
+      backend: pytorch
+      enable_chunked_prefill: true
+      disable_overlap_scheduler: false
+      cuda_graph_config:
+        max_batch_size: 16
+      kv_cache_config:
+        free_gpu_memory_fraction: 0.85
+      cache_transceiver_config:
+        backend: DEFAULT
+
+dynamo:
+  install: false
+
+benchmark:
+  type: sa-bench
+  isl: 256
+  osl: 128
+  concurrencies: "1"
+  req_rate: inf

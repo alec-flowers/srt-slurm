@@ -53,6 +53,16 @@ class TRTLLMProtocol:
               chunked-prefill-size: 8192
             decode:
               mem-fraction-static: 0.9
+
+    For conditional prefill (decode workers handle both disagg and agg requests):
+        backend:
+          type: trtllm
+          conditional_prefill: true
+          trtllm_config:
+            prefill:
+              ...
+            decode:
+              ...
     """
 
     type: Literal["trtllm"] = "trtllm"
@@ -60,6 +70,11 @@ class TRTLLMProtocol:
     prefill_environment: dict[str, str] = field(default_factory=dict)
     decode_environment: dict[str, str] = field(default_factory=dict)
     aggregated_environment: dict[str, str] = field(default_factory=dict)
+
+    # When true, decode workers use --disaggregation-mode prefill_decode
+    # so they can handle both disaggregated (from prefill) and aggregated
+    # (prefill skipped by router) requests.
+    conditional_prefill: bool = False
 
     trtllm_config: TRTLLMServerConfig | None = None
 
@@ -192,7 +207,10 @@ class TRTLLMProtocol:
 
         # Only add disaggregation mode for prefill/decode, not for agg
         if mode != "agg":
-            cmd.extend(["--disaggregation-mode", mode])
+            disagg_mode = mode
+            if mode == "decode" and self.conditional_prefill:
+                disagg_mode = "prefill_decode"
+            cmd.extend(["--disaggregation-mode", disagg_mode])
 
         cmd.extend(
             [
