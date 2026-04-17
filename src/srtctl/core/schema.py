@@ -552,7 +552,7 @@ class BenchmarkConfig:
     osl: int | None = None
     concurrencies: list[int] | str | None = None
     req_rate: str | int | None = "inf"
-    sweep: Annotated[SweepConfig, SweepConfigField()] | None = None
+    sweep: Annotated[SweepConfig, SweepConfigField(allow_none=True)] | None = None
     # Accuracy benchmark fields
     num_examples: int | None = None
     max_tokens: int | None = None

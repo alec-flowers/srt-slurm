@@ -648,26 +648,26 @@ def submit_sweep(
             job_name = config_dict.get("name", f"job_{i}")
             progress.update(task, description=f"[{i}/{len(configs)}] {job_name}")
 
-        # Save temp config and submit
-        fd, temp_config_path = tempfile.mkstemp(suffix=".yaml", prefix="srtctl_sweep_", text=True)
-        try:
-            with os.fdopen(fd, "w") as f:
-                yaml.dump(config_dict, f)
+            # Save temp config and submit
+            fd, temp_config_path = tempfile.mkstemp(suffix=".yaml", prefix="srtctl_sweep_", text=True)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    yaml.dump(config_dict, f)
 
-            config = load_config(Path(temp_config_path))
-            submit_single(
-                config_path=Path(temp_config_path),
-                config=config,
-                dry_run=False,
-                setup_script=setup_script,
-                tags=tags,
-                output_dir=output_dir,
-            )
-        finally:
-            with contextlib.suppress(OSError):
-                os.remove(temp_config_path)
+                config = load_config(Path(temp_config_path))
+                submit_single(
+                    config_path=Path(temp_config_path),
+                    config=config,
+                    dry_run=False,
+                    setup_script=setup_script,
+                    tags=tags,
+                    output_dir=output_dir,
+                )
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(temp_config_path)
 
-            progress.advance(task)
+                progress.advance(task)
 
     console.print(f"\n[bold green]✅ Sweep complete![/] Submitted {len(configs)} jobs.")
 
