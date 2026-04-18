@@ -1,0 +1,121 @@
+name: shicheng_agg_tep8x1
+
+model:
+  path: kimi-k25-nvfp4
+  container: dyn-101-trtllm-rc11-condp-alec 
+  precision: fp4
+
+resources:
+  gpu_type: gb200
+  agg_nodes: 2
+  agg_workers: 1
+  gpus_per_agg: 8
+  gpus_per_node: 4
+
+backend:
+  type: trtllm
+  aggregated_environment:
+    NCCL_GRAPH_MIXING_SUPPORT: "0"
+    TRTLLM_ENABLE_PDL: "1"
+    TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS: "2"
+    OTEL_SERVICE_NAME: "dynamo-agg-shicheng-conc{conc}"  # overrides default "dynamo-prefill"
+    DYN_REASONING_PARSER: kimi_k25
+    DYN_TOOL_CALL_PARSER: kimi_k2
+  trtllm_config:
+    aggregated:
+      otlp_traces_endpoint: "http://10.57.209.4:4317"
+      # from computelab /home/scratch.shicli_gpu/kimi-k25-TEP8-delay
+      allreduce_strategy: MNNVL
+      max_num_tokens: 8192
+      enable_chunked_prefill: true
+      # disable_overlap_scheduler: true
+      cuda_graph_config:
+        batch_sizes:
+        - 1
+        - 2
+        - 4
+        - 8
+        - 16
+        - 32
+        - 64
+        - 128
+        enable_padding: true
+      enable_attention_dp: false
+      kv_cache_config:
+        dtype: fp8
+        enable_block_reuse: true
+        free_gpu_memory_fraction: 0.75
+        tokens_per_block: 32
+      max_batch_size: 128
+      moe_config:
+        backend: CUTLASS
+        use_low_precision_moe_combine: true
+      moe_expert_parallel_size: 8
+      nvfp4_gemm_config:
+        allowed_backends:
+        - cutlass
+        - cublaslt
+        - cuda_core
+      num_postprocess_workers: 8
+      print_iter_log: true
+      stream_interval: 10
+      tensor_parallel_size: 8
+      trust_remote_code: true
+      speculative_config:
+        decoding_type: Eagle3
+        max_draft_len: 3
+        speculative_model_dir:  /speculative-model
+        allow_advanced_sampling: true
+frontend:
+  type: dynamo
+  args:
+    active-prefill-tokens-threshold: 1000000000
+    active-decode-blocks-threshold: 100
+    active-prefill-tokens-threshold-frac: 100
+    router-mode: kv
+    router-reset-states: true
+  enable_multiple_frontends: false
+  env:
+    OTEL_SERVICE_NAME: "dynamo-frontend-shicheng-conc{conc}"  # overrides default "dynamo-frontend"
+    DYN_LOG: "info,dynamo_kv_router=debug,dynamo_llm::kv_router=debug"
+
+health_check:
+  max_attempts: 500
+  interval_seconds: 10
+
+dynamo:
+  install: false
+
+infra:
+  etcd_nats_dedicated_node: false
+  nats_max_payload_mb: 24
+
+observability:
+  enable_otel: true
+  otel_endpoint: "http://10.57.209.4:4317"
+
+extra_mount:
+  - "/lustre/fsw/coreai_dlfw_dev/karenc/srt-slurm/traces:/traces"
+  - "/lustre/fsw/coreai_dlfw_dev/karenc/models/Kimi-K2.5-Thinking-Eagle3:/speculative-model"
+
+sweep:
+  conc: [2, 4, 8, 16]
+  
+benchmark:
+  type: trace-replay
+  trace_file: /traces/kv-reuse-difficult_200k-fix/dataset.jsonl
+  concurrencies: "{conc}"  
+  ttft_threshold_ms: 5000
+  itl_threshold_ms: 7
+  aiperf_package: "aiperf>=0.7.0"
+  aiperf_args:
+    benchmark-duration: 600
+    benchmark-grace-period: 60
+    request-timeout-seconds: 1200
+    workers-max: 200
+    record-processors: 8
+    profile-export-level: raw
+    concurrency-ramp-duration: 20
+    export-http-trace: true
+    
+

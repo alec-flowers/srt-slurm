@@ -1,0 +1,104 @@
+name: david_agg_tep8x1_noeagle_nccl
+
+model:
+  path: kimi-k25-nvfp4
+  container: dyn-101-trtllm-rc11-condp-alec
+  precision: fp4
+
+resources:
+  gpu_type: gb200
+  agg_nodes: 2
+  agg_workers: 1
+  gpus_per_agg: 8
+  gpus_per_node: 4
+
+backend:
+  type: trtllm
+  aggregated_environment:
+    NCCL_GRAPH_MIXING_SUPPORT: "0"
+    TRTLLM_ENABLE_PDL: "1"
+    OTEL_SERVICE_NAME: "dynamo-agg-david-noeagle-conc{conc}"  # overrides default "dynamo-prefill"
+    DYN_REASONING_PARSER: kimi_k25
+    DYN_TOOL_CALL_PARSER: kimi_k2
+  trtllm_config:
+    # https://github.com/ai-dynamo/dynamo/blob/main/recipes/kimi-k2.5/trtllm/agg/nvidia/deploy-specdec.yaml 
+    aggregated:
+      otlp_traces_endpoint: "http://10.57.209.4:4317"
+      backend: pytorch
+      trust_remote_code: true
+      allreduce_strategy: NCCL # MNNVL can't do MNT >149k ish
+      max_num_tokens: 203200  # dataset max tokens 200k
+      enable_chunked_prefill: false
+      enable_attention_dp: false
+      max_batch_size: 16
+      cuda_graph_config:
+        batch_sizes:
+          - 1
+          - 2
+          - 4
+          - 8
+          - 16
+        enable_padding: true
+      kv_cache_config:
+        dtype: fp8
+        enable_block_reuse: true
+        free_gpu_memory_fraction: 0.75
+      moe_config:
+        backend: TRTLLM
+        max_num_tokens: 2048
+      moe_expert_parallel_size: 8
+      num_postprocess_workers: 8
+      print_iter_log: true
+      stream_interval: 10
+      tensor_parallel_size: 8
+frontend:
+  type: dynamo
+  args:
+    router-mode: kv
+    router-reset-states: true
+    active-prefill-tokens-threshold: 1000000000
+    active-decode-blocks-threshold: 100
+    active-prefill-tokens-threshold-frac: 100
+  enable_multiple_frontends: false
+  env:
+    OTEL_SERVICE_NAME: "dynamo-frontend-david-noeagle-conc{conc}"  # overrides default "dynamo-frontend"
+    DYN_LOG: "info,dynamo_kv_router=debug,dynamo_llm::kv_router=debug"
+
+health_check:
+  max_attempts: 500
+  interval_seconds: 10
+
+dynamo:
+  install: false
+
+infra:
+  etcd_nats_dedicated_node: true
+  nats_max_payload_mb: 24
+
+observability:
+  enable_otel: true
+  otel_endpoint: "http://10.57.209.4:4317"
+
+extra_mount:
+  - "/lustre/fsw/coreai_dlfw_dev/karenc/srt-slurm/traces:/traces"
+
+sweep:
+  conc: [2, 4, 8, 16]
+
+benchmark:
+  type: trace-replay
+  trace_file: /traces/kv-reuse-difficult_200k-fix/dataset.jsonl
+  concurrencies: "{conc}"
+  ttft_threshold_ms: 5000
+  itl_threshold_ms: 7
+  aiperf_package: "aiperf>=0.7.0"
+  aiperf_args:
+    benchmark-duration: 600
+    benchmark-grace-period: 60
+    request-timeout-seconds: 1200
+    workers-max: 200
+    record-processors: 8
+    profile-export-level: raw
+    concurrency-ramp-duration: 20
+    export-http-trace: true
+    

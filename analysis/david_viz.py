@@ -145,6 +145,8 @@ def row_from_srtslurm_job(job_dir: Path) -> Dict[str, object] | None:
     
     request_count = parse_float(data.get("request_count", {}).get("avg"))
     error_count = parse_float(data.get("error_request_count", {}).get("avg"))
+    if error_count is None:
+        error_count = 0.0
     
     ttft = data.get("time_to_first_token", {})
     itl = data.get("inter_token_latency", {})
@@ -159,8 +161,8 @@ def row_from_srtslurm_job(job_dir: Path) -> Dict[str, object] | None:
     if total_token_tput and info["gpus"]:
         total_token_tput_per_gpu = total_token_tput / info["gpus"]
     
-    error_rate_pct = None
-    if request_count and error_count is not None:
+    error_rate_pct = 0.0
+    if request_count:
         total = request_count + error_count
         if total > 0:
             error_rate_pct = (error_count / total) * 100
@@ -396,7 +398,9 @@ def format_tsv_value(val) -> str:
     if val is None:
         return ""
     if isinstance(val, float):
-        if abs(val) < 0.01:
+        if val == 0:
+            return "0"
+        elif abs(val) < 0.01:
             return f"{val:.6f}"
         elif abs(val) < 1:
             return f"{val:.4f}"
