@@ -567,6 +567,87 @@ class SlurmConfig:
 
 
 @dataclass(frozen=True)
+class SiteSlurmConfig:
+    """Cluster binding for SLURM settings in self-contained recipes."""
+
+    account: str | None = None
+    partition: str | None = None
+    time_limit: str | None = None
+    network_interface: str | None = None
+    use_gpus_per_node_directive: bool = True
+    use_segment_sbatch_directive: bool = True
+    use_exclusive_sbatch_directive: bool = False
+
+    Schema: ClassVar[type[Schema]] = Schema
+
+
+@dataclass(frozen=True)
+class SiteOutputConfig:
+    """Cluster-local output path for job artifacts."""
+
+    path: str | None = None
+
+    Schema: ClassVar[type[Schema]] = Schema
+
+
+@dataclass(frozen=True)
+class SiteModelConfig:
+    """Main model binding plus optional portable identity metadata."""
+
+    path: str
+    hf_repo: str | None = None
+    revision: str | None = None
+    precision: str | None = None
+
+    Schema: ClassVar[type[Schema]] = Schema
+
+
+@dataclass(frozen=True)
+class SiteSpeculativeModelConfig:
+    """Speculative/Eagle model binding plus optional portable identity metadata."""
+
+    path: str
+    target: str = "/speculative-model"
+    hf_repo: str | None = None
+    revision: str | None = None
+
+    Schema: ClassVar[type[Schema]] = Schema
+
+
+@dataclass(frozen=True)
+class SiteContainerConfig:
+    """Container binding plus optional portable identity metadata."""
+
+    path: str
+    image: str | None = None
+    digest: str | None = None
+    frameworks: dict[str, str] = field(default_factory=dict)
+
+    Schema: ClassVar[type[Schema]] = Schema
+
+
+@dataclass(frozen=True)
+class SiteConfig:
+    """Self-contained cluster binding for a recipe.
+
+    A site block is the single visible area a reproducer edits when moving a
+    recipe to a different cluster. Only model.path and container.path are
+    required for launch; identity metadata is optional and enriches validation
+    and lockfiles.
+    """
+
+    name: str | None = None
+    slurm: SiteSlurmConfig = field(default_factory=SiteSlurmConfig)
+    output: SiteOutputConfig = field(default_factory=SiteOutputConfig)
+    model: SiteModelConfig | None = None
+    speculative_model: SiteSpeculativeModelConfig | None = None
+    container: SiteContainerConfig | None = None
+    mounts: tuple[str, ...] | None = None
+
+    Schema: ClassVar[type[Schema]] = Schema
+
+
+@dataclass(frozen=True)
 class BenchmarkConfig:
     """Benchmark configuration."""
 
@@ -1083,6 +1164,7 @@ class SrtConfig:
     infra: InfraConfig = field(default_factory=InfraConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+    site: SiteConfig | None = None
 
     environment: dict[str, str] = field(default_factory=dict)
     container_mounts: dict[
@@ -1192,6 +1274,9 @@ class SrtConfig:
     def from_yaml(cls, yaml_path: Path) -> "SrtConfig":
         with open(yaml_path) as f:
             data = yaml.safe_load(f)
+        from srtctl.core.config import normalize_site_config
+
+        data = normalize_site_config(data)
         schema = cls.Schema()
         return schema.load(data)
 

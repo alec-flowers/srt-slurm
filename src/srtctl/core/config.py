@@ -26,6 +26,11 @@ from .schema import ClusterConfig, SrtConfig
 
 logger = logging.getLogger(__name__)
 
+_SITE_MODEL_CONFLICT = (
+    "Recipes using 'site:' must move model/container fields under site.model and site.container; "
+    "remove the legacy top-level 'model:' block."
+)
+
 
 def load_cluster_config() -> dict[str, Any] | None:
     """
@@ -82,6 +87,81 @@ def load_cluster_config() -> dict[str, Any] | None:
         return None
 
 
+def _merge_site_identity(config: dict[str, Any], site: dict[str, Any]) -> None:
+    """Populate legacy identity fields from site metadata for validation/fingerprints."""
+    identity = copy.deepcopy(config.get("identity") or {})
+    changed = bool(identity)
+
+    site_model = site.get("model") or {}
+    if site_model.get("hf_repo") or site_model.get("revision"):
+        model_identity = identity.setdefault("model", {})
+        if site_model.get("hf_repo") and not model_identity.get("repo"):
+            model_identity["repo"] = site_model["hf_repo"]
+            changed = True
+        if site_model.get("revision") and not model_identity.get("revision"):
+            model_identity["revision"] = site_model["revision"]
+            changed = True
+
+    site_container = site.get("container") or {}
+    if site_container.get("image"):
+        container_identity = identity.setdefault("container", {})
+        if not container_identity.get("image"):
+            container_identity["image"] = site_container["image"]
+            changed = True
+
+    frameworks = site_container.get("frameworks") or {}
+    if frameworks:
+        identity_frameworks = identity.setdefault("frameworks", {})
+        for name, version in frameworks.items():
+            if name not in identity_frameworks:
+                identity_frameworks[name] = version
+                changed = True
+
+    if changed:
+        config["identity"] = identity
+
+
+def normalize_site_config(user_config: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a self-contained site recipe into the legacy internal shape.
+
+    The public API puts model/container paths under ``site``. Internally, the
+    existing runtime expects ``config.model``. This function synthesizes that
+    compatibility layer before marshmallow validation.
+    """
+    config = copy.deepcopy(user_config)
+    site = config.get("site")
+    if site is None:
+        return config
+    if not isinstance(site, dict):
+        raise ValueError("'site' must be a mapping")
+    if "model" in config:
+        raise ValueError(_SITE_MODEL_CONFLICT)
+
+    site_model = site.get("model")
+    site_container = site.get("container")
+    if not isinstance(site_model, dict) or not site_model.get("path"):
+        raise ValueError("site.model.path is required")
+    if not isinstance(site_container, dict) or not site_container.get("path"):
+        raise ValueError("site.container.path is required")
+
+    config["model"] = {
+        "path": site_model["path"],
+        "container": site_container["path"],
+        "precision": site_model.get("precision") or "unknown",
+    }
+
+    site_slurm = site.get("slurm") or {}
+    if site_slurm:
+        slurm = copy.deepcopy(config.get("slurm") or {})
+        for key in ("account", "partition", "time_limit"):
+            if key in site_slurm and key not in slurm:
+                slurm[key] = site_slurm[key]
+        config["slurm"] = slurm
+
+    _merge_site_identity(config, site)
+    return config
+
+
 def resolve_config_with_defaults(user_config: dict[str, Any], cluster_config: dict[str, Any] | None) -> dict[str, Any]:
     """
     Resolve user config by applying cluster defaults and aliases.
@@ -100,6 +180,9 @@ def resolve_config_with_defaults(user_config: dict[str, Any], cluster_config: di
     """
     # Deep copy to avoid mutating original
     config = copy.deepcopy(user_config)
+
+    if config.get("site") is not None:
+        return normalize_site_config(config)
 
     if cluster_config is None:
         return config
@@ -475,9 +558,9 @@ def validate_config_file(path: Path | str) -> list[str]:
         except Exception as e:
             return [f"{path}: failed to expand overrides: {e}"]
 
-        cluster_config = load_cluster_config()
         schema = SrtConfig.Schema()
         for suffix, config_dict in variants:
+            cluster_config = None if config_dict.get("site") is not None else load_cluster_config()
             resolved = resolve_config_with_defaults(config_dict, cluster_config)
             try:
                 schema.load(resolved)
@@ -533,6 +616,8 @@ def load_config(path: Path | str) -> SrtConfig:
     # Load raw user config
     with open(path) as f:
         user_config = yaml.safe_load(f)
+    if not isinstance(user_config, dict):
+        raise ValueError(f"Invalid config in {path}: expected a YAML mapping")
 
     # Strip lock: section if present (lockfiles are valid recipes)
     # Preserved for comparison after the new run completes
@@ -544,8 +629,16 @@ def load_config(path: Path | str) -> SrtConfig:
             logger.warning("Loaded lockfile — integrity check FAILED (lock section may have been edited)")
             logger.warning("Comparison results may not reflect the original run")
 
-    # Load cluster defaults (optional)
-    cluster_config = load_cluster_config()
+    # Load legacy cluster defaults only when the new self-contained site block
+    # is absent. srtslurm.yaml remains transitional compatibility, not the
+    # canonical config source.
+    cluster_config = None
+    if user_config.get("site") is None:
+        cluster_config = load_cluster_config()
+        if cluster_config:
+            logger.warning(
+                "srtslurm.yaml is deprecated for reproducible recipes; add a self-contained site: block instead."
+            )
 
     # Resolve with defaults (applies aliases and default values)
     resolved_config = resolve_config_with_defaults(user_config, cluster_config)

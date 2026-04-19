@@ -227,6 +227,20 @@ class TestWriteLockfile:
         lockfile_text = (tmp_path / "recipe.lock.yaml").read_text()
         assert lockfile_text.startswith('name: "test-job"')
 
+    def test_recipe_exact_hash_matches_preserved_recipe_body(self, tmp_path):
+        recipe = 'name: "test-job"\nmodel:\n  path: "/model"\n  container: "/c.sqsh"\n  precision: "fp8"\n'
+        _write_recipe(tmp_path, recipe)
+        config = _make_minimal_config()
+
+        write_lockfile(tmp_path, config)
+
+        lockfile_text = (tmp_path / "recipe.lock.yaml").read_text()
+        recipe_body = lockfile_text.split(
+            "# ============================================================================", 1
+        )[0].rstrip()
+        data = yaml.safe_load(lockfile_text)
+        assert data["lock"]["hashes"]["recipe_exact"]["value"] == hashlib.sha256(recipe_body.encode()).hexdigest()
+
     def test_has_lock_section(self, tmp_path):
         """The lockfile has a lock: section with version and slurm context."""
         _write_recipe(tmp_path)

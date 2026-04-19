@@ -26,7 +26,7 @@ Running large language models across multiple GPUs and nodes requires orchestrat
 When you run `srtctl apply -f config.yaml`, the tool:
 
 1. Validates your configuration against the schema
-2. Resolves any aliases from your cluster config (`srtslurm.yaml`)
+2. Resolves the self-contained `site:` block, or legacy aliases from `srtslurm.yaml`
 3. Generates a SLURM batch script and SGLang configuration files
 4. Submits to SLURM
 

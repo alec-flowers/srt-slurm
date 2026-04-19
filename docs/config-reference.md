@@ -5,7 +5,9 @@ Complete reference for job configuration YAML files.
 ## Table of Contents
 
 - [Overview](#overview)
-- [Cluster Config Discovery](#cluster-config-discovery)
+- [site](#site)
+- [Lockfile Hashes](#lockfile-hashes)
+- [Legacy Cluster Config Discovery](#legacy-cluster-config-discovery)
 - [name](#name)
 - [model](#model)
 - [resources](#resources)
@@ -37,18 +39,33 @@ Complete reference for job configuration YAML files.
 ```yaml
 name: "my-benchmark"           # Required: job name
 
-model:                         # Required: model settings
-  path: "deepseek-r1"
-  container: "latest"
-  precision: "fp8"
+site:                          # Required for new self-contained recipes
+  name: "lyris"
+  slurm:
+    account: "my-account"
+    partition: "batch"
+    time_limit: "04:00:00"
+    network_interface: "eth0"
+  output:
+    path: "/lustre/.../srt-slurm/outputs"
+  model:
+    path: "/lustre/.../models/deepseek-r1"
+    hf_repo: "deepseek-ai/DeepSeek-R1"   # optional reproducibility metadata
+    revision: "abc123..."                # optional
+    precision: "fp8"                     # optional metadata
+  container:
+    path: "/lustre/.../containers/runtime.sqsh"
+    image: "registry.example/runtime:tag" # optional
+    frameworks:                          # optional expected runtime versions
+      dynamo: "1.0.0"
+      sglang: "0.4.6"
+  mounts:
+    - "/lustre/.../traces:/traces"
 
 resources:                     # Required: GPU allocation
   gpu_type: "gb200"
   prefill_nodes: 1
   decode_nodes: 2
-
-slurm:                         # Optional: SLURM overrides
-  time_limit: "02:00:00"
 
 frontend:                      # Optional: router/frontend config
   type: dynamo
@@ -82,7 +99,102 @@ setup_script: "my-setup.sh"    # Optional: custom setup script
 
 ---
 
-## Cluster Config Discovery
+## site
+
+`site:` is the canonical place where a recipe binds to a cluster. A new recipe should put cluster-specific paths, SLURM settings, model/container metadata, output path, and regular mounts here. This keeps the recipe self-contained instead of splitting reproducibility data across a recipe plus `srtslurm.yaml`.
+
+Minimal runnable form:
+
+```yaml
+site:
+  model:
+    path: "/lustre/.../models/deepseek-r1"
+  container:
+    path: "/lustre/.../containers/runtime.sqsh"
+```
+
+Careful reproducibility form:
+
+```yaml
+site:
+  name: "lyris"
+  slurm:
+    account: "my-account"
+    partition: "batch"
+    time_limit: "04:00:00"
+    network_interface: "eth0"
+    use_gpus_per_node_directive: true
+    use_segment_sbatch_directive: true
+    use_exclusive_sbatch_directive: false
+  output:
+    path: "/lustre/.../srt-slurm/outputs"
+  model:
+    path: "/lustre/.../models/Kimi-K2.5-NVFP4"
+    hf_repo: "nvidia/Kimi-K2.5-NVFP4"
+    revision: "c0285e649c34..."
+    precision: "fp4"
+  speculative_model:
+    path: "/lustre/.../models/Kimi-K2.5-Thinking-Eagle3"
+    target: "/speculative-model"
+    hf_repo: "nvidia/Kimi-K2.5-Thinking-Eagle3"
+    revision: "abc123..."
+  container:
+    path: "/lustre/.../containers/trtllm-runtime.sqsh"
+    image: "registry.example/dynamo:tag"
+    digest: "sha256:..."
+    frameworks:
+      dynamo: "1.0.0"
+      tensorrt_llm: "1.3.0rc9"
+  mounts:
+    - "/lustre/.../traces:/traces"
+```
+
+| Field | Type | Required | Description |
+| ----- | ---- | -------- | ----------- |
+| `name` | string | No | Cluster/site name recorded in status and lockfiles |
+| `slurm` | map | No | SLURM account, partition, time limit, network interface, and directive toggles |
+| `output.path` | string | No | Base output directory; jobs write to `{path}/{job_id}` |
+| `model.path` | string | Yes | Local model directory or `hf:<repo>` model ID |
+| `model.hf_repo` | string | No | Expected HuggingFace repo for validation/lockfile metadata |
+| `model.revision` | string | No | Expected HuggingFace commit/revision |
+| `model.precision` | string | No | Informational precision; defaults internally to `unknown` |
+| `speculative_model.path` | string | No | Optional draft/speculative model directory |
+| `speculative_model.target` | string | No | Container mount target; defaults to `/speculative-model` |
+| `container.path` | string | Yes | Local `.sqsh`/container path or image string used to launch |
+| `container.image` | string | No | Pullable image URI recorded for reproduction |
+| `container.digest` | string | No | Expected image digest recorded for reproduction |
+| `container.frameworks` | map | No | Expected framework versions, such as `dynamo`, `sglang`, `vllm`, or `tensorrt_llm` |
+| `mounts` | list[string] | No | Extra `host:container` mounts |
+
+If `site:` is present, do not also declare top-level `model:`. `srtctl` rejects mixed recipes with a clear migration error.
+
+Optional metadata never blocks submission. It is used for warn-only validation when detectable, and `recipe.lock.yaml` records declared metadata separately from observed/inferred metadata.
+
+---
+
+## Lockfile Hashes
+
+`recipe.lock.yaml` keeps the submitted recipe body above `lock:` and appends reproducibility data. Normal recipes do not need a visible hashing policy; `srtctl` uses smart, non-blocking defaults.
+
+`lock.hashes` records:
+
+| Field | Description |
+| ----- | ----------- |
+| `recipe_exact` | SHA256 of the preserved recipe text above `lock:` |
+| `normalized_intent` | SHA256 of portable benchmark intent, excluding cluster-local `site` paths, SLURM, and output host bindings |
+| `site_binding` | SHA256 of the cluster-local binding block, including model/container paths, output path, SLURM settings, and mounts |
+
+`lock.artifacts` records relative manifests for `site.model`, `site.speculative_model`, and `site.mounts`. Manifest hashes do not include absolute host paths, so a recreated run can move to a different filesystem while preserving the artifact tree identity. Small files such as `config.json` and tokenizer metadata are hashed immediately; large model weights are listed by relative path and size and skipped by default.
+
+Every hash reports a status: `complete`, `partial`, `skipped_large_file`, `skipped_directory`, or `error`. Container content hashing is intentionally skipped for now; the lockfile records declared image/digest metadata and observed container file metadata.
+
+`lock.artifacts.runtime_code` records the generated sbatch script, submitted/resolved configs, generated runtime YAMLs, setup script, and the `srtctl` git commit plus dirty-tree hash when available.
+
+---
+
+## Legacy Cluster Config Discovery
+
+`srtslurm.yaml` is legacy compatibility for recipes that still use top-level `model:` aliases and cluster-wide defaults. New recipes should use `site:` instead.
 
 srtctl looks for `srtslurm.yaml` (cluster-wide settings) in this order:
 
@@ -98,7 +210,7 @@ For users working in deep directory structures (e.g., study directories), set `S
 export SRTSLURM_CONFIG="/path/to/srt-slurm/srtslurm.yaml"
 ```
 
-This allows you to run `srtctl apply -f config.yaml` from anywhere without needing `srtslurm.yaml` nearby.
+This allows legacy recipes to run `srtctl apply -f config.yaml` from anywhere without needing `srtslurm.yaml` nearby.
 
 ### Cluster Config Fields
 
@@ -135,7 +247,7 @@ name: "deepseek-r1-benchmark"
 
 ## model
 
-Model and container configuration.
+Legacy model and container configuration. This remains supported for existing recipes, but new recipes should use `site.model` and `site.container`.
 
 ```yaml
 model:

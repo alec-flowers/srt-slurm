@@ -18,6 +18,7 @@
   - [srtctl apply](#srtctl-apply)
   - [srtctl dry-run](#srtctl-dry-run)
   - [srtctl resolve-override](#srtctl-resolve-override)
+  - [srtctl migrate-site](#srtctl-migrate-site)
 - [Output](#output)
 - [Sweep Support](#sweep-support)
 - [Config Override Support](#config-override-support)
@@ -303,11 +304,39 @@ srtctl dry-run -f override-config.yaml:override_tp64
 
 Dry-run output includes:
 - Syntax-highlighted sbatch script
-- Container mounts table (labeled by source: built-in, srtslurm.yaml, recipe)
+- Container mounts table (labeled by source: built-in, site, srtslurm.yaml legacy, recipe)
 - Environment variables table (grouped by scope: global, prefill, decode, aggregated)
 - srun options (if configured)
 - For sweeps: table of all jobs with parameters
 - Generated configs saved to `dry-runs/` folder
+
+### `srtctl migrate-site`
+
+Convert a legacy recipe plus `srtslurm.yaml` aliases into a self-contained recipe with a `site:` block.
+
+```bash
+srtctl migrate-site -f <recipe.yaml> --srtslurm <srtslurm.yaml> --site-name <name> [options]
+```
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `-f, --file` | Legacy recipe YAML (required) |
+| `--srtslurm` | Legacy cluster config used to resolve aliases (required) |
+| `--site-name` | Name for the generated `site:` block (required) |
+| `-o, --output` | Output path for the migrated recipe |
+| `--stdout` | Print migrated YAML to stdout instead of writing a file |
+
+**Examples:**
+
+```bash
+# Write config.site.yaml next to config.yaml
+srtctl migrate-site -f config.yaml --srtslurm srtslurm.yaml --site-name lyris
+
+# Inspect the migrated YAML
+srtctl migrate-site -f config.yaml --srtslurm srtslurm.yaml --site-name lyris --stdout
+```
 
 ### `srtctl resolve-override`
 
@@ -412,4 +441,3 @@ grep -E "Env:|Command:" outputs/<job_id>/logs/sweep_<job_id>.log
 - Use `srtctl apply -f` for scripting and CI pipelines
 - Always `dry-run` first for sweeps to check job count
 - Check `outputs/<job_id>/` for submitted configs and metadata
-

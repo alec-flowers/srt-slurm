@@ -20,6 +20,18 @@ if TYPE_CHECKING:
     from srtctl.core.schema import SrtConfig
 
 
+def _site_network_interface(config: "SrtConfig") -> str | None:
+    if config.site and config.site.slurm.network_interface is not None:
+        return config.site.slurm.network_interface
+    return get_srtslurm_setting("network_interface", "eth0")
+
+
+def _add_mount_spec(container_mounts: dict[Path, Path], mount_spec: str) -> None:
+    host_path, container_path = mount_spec.split(":", 1)
+    expanded_host = os.path.expandvars(host_path)
+    container_mounts[Path(expanded_host).resolve()] = Path(container_path)
+
+
 @dataclass(frozen=True)
 class Nodes:
     """Node allocation for head, benchmark, infra, and worker nodes.
@@ -218,18 +230,32 @@ class RuntimeContext:
         if SCRIPTS_DIR.exists():
             container_mounts[SCRIPTS_DIR.resolve()] = Path("/srtctl-benchmarks")
 
-        # Add cluster-level mounts from srtslurm.yaml
-        cluster_mounts = get_srtslurm_setting("default_mounts")
-        if cluster_mounts:
-            for host_path, container_path in cluster_mounts.items():
-                expanded_host = os.path.expandvars(host_path)
-                container_mounts[Path(expanded_host).resolve()] = Path(container_path)
+        # Add site-level mounts for self-contained recipes, or legacy cluster
+        # mounts from srtslurm.yaml when site is absent.
+        if config.site and config.site.mounts:
+            for mount_spec in config.site.mounts:
+                _add_mount_spec(container_mounts, mount_spec)
+        elif not config.site:
+            cluster_mounts = get_srtslurm_setting("default_mounts")
+            if cluster_mounts:
+                for host_path, container_path in cluster_mounts.items():
+                    expanded_host = os.path.expandvars(host_path)
+                    container_mounts[Path(expanded_host).resolve()] = Path(container_path)
+
+        # Add optional speculative model mount. This is intentionally separate
+        # from generic mounts so the lockfile can enrich it as a model artifact.
+        if config.site and config.site.speculative_model:
+            spec_host = Path(os.path.expandvars(config.site.speculative_model.path)).resolve()
+            if not spec_host.exists():
+                raise FileNotFoundError(f"Speculative model path does not exist: {spec_host}")
+            if not spec_host.is_dir():
+                raise ValueError(f"Speculative model path is not a directory: {spec_host}")
+            container_mounts[spec_host] = Path(config.site.speculative_model.target)
 
         # Add extra mounts from config
         if config.extra_mount:
             for mount_spec in config.extra_mount:
-                host_path, container_path = mount_spec.split(":", 1)
-                container_mounts[Path(host_path).resolve()] = Path(container_path)
+                _add_mount_spec(container_mounts, mount_spec)
 
         # Add FormattablePath mounts from config.container_mounts
         # These need to be expanded with the runtime context, so we create a
@@ -244,7 +270,7 @@ class RuntimeContext:
             model_path=model_path,
             container_image=container_image,
             gpus_per_node=config.resources.gpus_per_node,
-            network_interface=get_srtslurm_setting("network_interface", "eth0"),
+            network_interface=_site_network_interface(config),
             container_mounts={},
             srun_options=dict(config.srun_options),
             environment=dict(config.environment),
@@ -267,7 +293,7 @@ class RuntimeContext:
             model_path=model_path,
             container_image=container_image,
             gpus_per_node=config.resources.gpus_per_node,
-            network_interface=get_srtslurm_setting("network_interface", "eth0"),
+            network_interface=_site_network_interface(config),
             container_mounts=container_mounts,
             srun_options=dict(config.srun_options),
             environment=dict(config.environment),

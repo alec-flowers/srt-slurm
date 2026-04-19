@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -164,6 +165,34 @@ def setup_logging(level: int = logging.INFO) -> None:
     )
 
 
+def get_srtctl_source(config: SrtConfig | None = None) -> Path:
+    """Return the srt-slurm source root used by generated jobs."""
+    if config is None or config.site is None:
+        srtctl_root = get_srtslurm_setting("srtctl_root")
+        if srtctl_root:
+            return Path(os.path.expandvars(srtctl_root))
+    return Path(__file__).parent.parent.parent.parent
+
+
+def get_output_base(config: SrtConfig, output_dir: Path | None = None) -> Path:
+    """Resolve the output base directory for a job."""
+    if output_dir:
+        return output_dir.resolve()
+    if config.site and config.site.output.path:
+        return Path(os.path.expandvars(config.site.output.path)).resolve()
+    custom_output_dir = get_srtslurm_setting("output_dir") if config.site is None else None
+    if custom_output_dir:
+        return Path(os.path.expandvars(custom_output_dir)).resolve()
+    return (get_srtctl_source(config) / "outputs").resolve()
+
+
+def get_status_cluster_name(config: SrtConfig) -> str | None:
+    """Cluster/site name used for status reporting."""
+    if config.site and config.site.name:
+        return config.site.name
+    return get_srtslurm_setting("cluster")
+
+
 def show_config_details(config: SrtConfig) -> None:
     """Display container mounts and environment variables for dry-run verification.
 
@@ -182,12 +211,27 @@ def show_config_details(config: SrtConfig) -> None:
     mounts_table.add_row("built-in", model_path, "/model")
     mounts_table.add_row("built-in", "<log_dir>", "/logs")
 
-    # Cluster-level mounts from srtslurm.yaml
-    cluster_mounts = get_srtslurm_setting("default_mounts")
+    if config.site and config.site.speculative_model:
+        mounts_table.add_row(
+            "site",
+            os.path.expandvars(config.site.speculative_model.path),
+            config.site.speculative_model.target,
+        )
+
+    if config.site and config.site.mounts:
+        for mount_spec in config.site.mounts:
+            parts = mount_spec.split(":", 1)
+            if len(parts) == 2:
+                mounts_table.add_row("site", os.path.expandvars(parts[0]), parts[1])
+            else:
+                mounts_table.add_row("site", mount_spec, mount_spec)
+
+    # Legacy cluster-level mounts from srtslurm.yaml
+    cluster_mounts = get_srtslurm_setting("default_mounts") if config.site is None else None
     if cluster_mounts:
         for host_path, container_path in cluster_mounts.items():
             expanded = os.path.expandvars(host_path)
-            mounts_table.add_row("srtslurm.yaml", expanded, container_path)
+            mounts_table.add_row("srtslurm.yaml (legacy)", expanded, container_path)
 
     # Recipe extra_mount (simple string mounts)
     if config.extra_mount:
@@ -321,20 +365,12 @@ def generate_minimal_sbatch_script(
     # Templates are now in src/srtctl/templates/
     template_dir = Path(__file__).parent.parent / "templates"
 
-    srtctl_root = get_srtslurm_setting("srtctl_root")
     # srtctl source is the parent of src/srtctl (i.e., the repo root)
-    srtctl_source = Path(srtctl_root) if srtctl_root else Path(__file__).parent.parent.parent.parent
+    srtctl_source = get_srtctl_source(config)
 
     # Determine output base directory
-    # Priority: CLI -o flag > srtslurm.yaml output_dir > srtctl_root/outputs
-    if output_dir:
-        output_base = str(output_dir.resolve())
-    else:
-        custom_output_dir = get_srtslurm_setting("output_dir")
-        if custom_output_dir:
-            output_base = str(Path(os.path.expandvars(custom_output_dir)).resolve())
-        else:
-            output_base = str((srtctl_source / "outputs").resolve())
+    # Priority: CLI -o flag > site.output.path > legacy srtslurm.yaml output_dir > source/outputs
+    output_base = str(get_output_base(config, output_dir))
 
     env = Environment(loader=FileSystemLoader(str(template_dir)))
     template = env.get_template("job_script_minimal.j2")
@@ -345,10 +381,11 @@ def generate_minimal_sbatch_script(
         total_nodes += 1
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Resolve container image path (expand aliases from srtslurm.yaml)
+    # Resolve container image path
     container_image = os.path.expandvars(config.model.container)
 
     job_name = get_job_name(config)
+    site_slurm = config.site.slurm if config.site else None
 
     rendered = template.render(
         job_name=job_name,
@@ -361,9 +398,15 @@ def generate_minimal_sbatch_script(
         config_path=str(config_path.resolve()),
         runtime_config_filename=runtime_config_filename,
         timestamp=timestamp,
-        use_gpus_per_node_directive=get_srtslurm_setting("use_gpus_per_node_directive", True),
-        use_segment_sbatch_directive=get_srtslurm_setting("use_segment_sbatch_directive", True),
-        use_exclusive_sbatch_directive=get_srtslurm_setting("use_exclusive_sbatch_directive", False),
+        use_gpus_per_node_directive=site_slurm.use_gpus_per_node_directive
+        if site_slurm
+        else get_srtslurm_setting("use_gpus_per_node_directive", True),
+        use_segment_sbatch_directive=site_slurm.use_segment_sbatch_directive
+        if site_slurm
+        else get_srtslurm_setting("use_segment_sbatch_directive", True),
+        use_exclusive_sbatch_directive=site_slurm.use_exclusive_sbatch_directive
+        if site_slurm
+        else get_srtslurm_setting("use_exclusive_sbatch_directive", False),
         sbatch_directives=config.sbatch_directives,
         container_image=container_image,
         srtctl_source=str(srtctl_source.resolve()),
@@ -406,25 +449,28 @@ def _print_running_summary(config: SrtConfig, console: Console) -> None:
     else:
         console.print()
         console.print(
-            "[yellow]Tip:[/] Add an [bold]identity:[/] block to your recipe so others can replicate your results."
+            "[yellow]Tip:[/] Add optional [bold]site.model[/]/[bold]site.container[/] metadata so others can replicate your results."
         )
-        console.print("[yellow]     Without it, someone reading this recipe can't tell which exact model[/]")
-        console.print("[yellow]     weights or framework versions produced the benchmark numbers.[/]")
-        console.print("[yellow]     At job start, srtctl verifies the runtime matches your declaration.[/]")
+        console.print("[yellow]     Paths are enough to run. hf_repo/revision/image/frameworks make the lockfile[/]")
+        console.print("[yellow]     more useful and let srtctl warn when observed runtime metadata differs.[/]")
         console.print()
-        console.print("[dim]     identity:[/]")
+        console.print("[dim]     site:[/]")
         console.print("[dim]       model:[/]")
-        console.print('[dim]         repo: "nvidia/Kimi-K2.5-NVFP4"       [/][dim italic]# HuggingFace model ID[/]')
-        console.print('[dim]         revision: "c0285e649c34..."            [/][dim italic]# HF commit SHA[/]')
+        console.print('[dim]         hf_repo: "nvidia/Kimi-K2.5-NVFP4"      [/][dim italic]# optional[/]')
+        console.print('[dim]         revision: "c0285e649c34..."            [/][dim italic]# optional HF commit SHA[/]')
         console.print("[dim]       container:[/]")
-        console.print('[dim]         image: "gitlab:5005/.../trtllm-arm64"  [/][dim italic]# pullable Docker URI[/]')
-        console.print("[dim]       frameworks:                              [/][dim italic]# dynamo + one engine[/]")
-        console.print('[dim]         dynamo: "1.0.0"                        [/][dim italic]# always (ai-dynamo)[/]')
-        console.print('[dim]         tensorrt_llm: "1.3.0rc9"              [/][dim italic]# OR vllm OR sglang[/]')
+        console.print(
+            '[dim]         image: "gitlab:5005/.../trtllm-arm64"  [/][dim italic]# optional pullable image[/]'
+        )
+        console.print(
+            "[dim]         frameworks:                            [/][dim italic]# optional expected versions[/]"
+        )
+        console.print('[dim]           dynamo: "1.0.0"[/]')
+        console.print('[dim]           tensorrt_llm: "1.3.0rc9"[/]')
         console.print()
-        console.print("[dim italic]     Agent: if you are an AI assistant creating this recipe, you MUST[/]")
-        console.print("[dim italic]     include the identity block. Use the container's framework versions[/]")
-        console.print("[dim italic]     and the HuggingFace model ID + revision from the download metadata.[/]")
+        console.print(
+            "[dim italic]     Missing metadata never blocks submission; recipe.lock.yaml will infer what it can.[/]"
+        )
 
 
 def submit_with_orchestrator(
@@ -509,8 +555,7 @@ def submit_with_orchestrator(
         return
 
     # Validate setup before submitting (not during dry-run)
-    srtctl_root = get_srtslurm_setting("srtctl_root")
-    srtctl_source = Path(srtctl_root) if srtctl_root else Path(__file__).parent.parent.parent.parent
+    srtctl_source = get_srtctl_source(config)
     validate_setup(srtctl_source)
 
     # Write script to temp file
@@ -534,17 +579,8 @@ def submit_with_orchestrator(
         job_id = result.stdout.strip().split()[-1]
 
         # Determine output directory
-        # Priority: CLI -o flag > srtslurm.yaml output_dir > srtctl_root/outputs
-        if output_dir:
-            job_output_dir = output_dir / job_id
-        else:
-            custom_output_dir = get_srtslurm_setting("output_dir")
-            if custom_output_dir:
-                job_output_dir = Path(os.path.expandvars(custom_output_dir)) / job_id
-            else:
-                srtctl_root = get_srtslurm_setting("srtctl_root")
-                srtctl_source = Path(srtctl_root) if srtctl_root else Path(__file__).parent.parent.parent.parent
-                job_output_dir = srtctl_source / "outputs" / job_id
+        # Priority: CLI -o flag > site.output.path > legacy srtslurm.yaml output_dir > source/outputs
+        job_output_dir = get_output_base(config, output_dir) / job_id
         job_output_dir.mkdir(parents=True, exist_ok=True)
 
         shutil.copy(source_config_path or config_path, job_output_dir / "config.yaml")
@@ -615,7 +651,7 @@ def submit_with_orchestrator(
             reporting=config.reporting,
             job_id=job_id,
             job_name=job_name,
-            cluster=get_srtslurm_setting("cluster"),
+            cluster=get_status_cluster_name(config),
             recipe=str(config_path),
             metadata=metadata,
         )
@@ -1000,7 +1036,9 @@ def submit_override(
 
         logger.info(f"Override variant: {variant_label} -> {job_name}")
 
-        resolved_config = resolve_config_with_defaults(yaml.safe_load(runtime_config_text), load_cluster_config())
+        raw_runtime_config = yaml.safe_load(runtime_config_text)
+        cluster_config = None if raw_runtime_config.get("site") is not None else load_cluster_config()
+        resolved_config = resolve_config_with_defaults(raw_runtime_config, cluster_config)
         config = SrtConfig.Schema().load(resolved_config)
 
         if "sweep" in config_cm:
@@ -1075,6 +1113,105 @@ def resolve_override_cmd(
         console.print(f"[green]Wrote:[/] {p}")
 
 
+def migrate_site_config(recipe_path: Path, srtslurm_path: Path, site_name: str) -> dict[str, Any]:
+    """Convert a legacy recipe + srtslurm.yaml into a self-contained site recipe."""
+    with open(recipe_path) as f:
+        recipe = yaml.safe_load(f)
+    with open(srtslurm_path) as f:
+        cluster = yaml.safe_load(f) or {}
+
+    if not isinstance(recipe, dict):
+        raise ValueError(f"{recipe_path} is not a YAML mapping")
+    if "base" in recipe:
+        raise ValueError("migrate-site does not support override-format YAML; resolve a variant first")
+    if "site" in recipe:
+        raise ValueError(f"{recipe_path} already has a site block")
+    if "model" not in recipe:
+        raise ValueError(f"{recipe_path} has no legacy top-level model block to migrate")
+
+    migrated = copy_without_keys(recipe, {"model", "identity", "extra_mount", "slurm"})
+    model = recipe.get("model") or {}
+    identity = recipe.get("identity") or {}
+    slurm = recipe.get("slurm") or {}
+
+    model_paths = cluster.get("model_paths") or {}
+    containers = cluster.get("containers") or {}
+    model_path = model_paths.get(model.get("path"), model.get("path"))
+    container_path = containers.get(model.get("container"), model.get("container"))
+
+    site_slurm = {
+        "account": slurm.get("account") or cluster.get("default_account"),
+        "partition": slurm.get("partition") or cluster.get("default_partition"),
+        "time_limit": slurm.get("time_limit") or cluster.get("default_time_limit"),
+        "network_interface": cluster.get("network_interface"),
+        "use_gpus_per_node_directive": cluster.get("use_gpus_per_node_directive", True),
+        "use_segment_sbatch_directive": cluster.get("use_segment_sbatch_directive", True),
+        "use_exclusive_sbatch_directive": cluster.get("use_exclusive_sbatch_directive", False),
+    }
+
+    output_path = cluster.get("output_dir")
+    if not output_path and cluster.get("srtctl_root"):
+        output_path = str(Path(cluster["srtctl_root"]) / "outputs")
+
+    identity_model = identity.get("model") or {}
+    identity_container = identity.get("container") or {}
+    site: dict[str, Any] = {
+        "name": site_name,
+        "slurm": compact_mapping(site_slurm),
+        "model": compact_mapping(
+            {
+                "path": model_path,
+                "hf_repo": identity_model.get("repo"),
+                "revision": identity_model.get("revision"),
+                "precision": model.get("precision"),
+            }
+        ),
+        "container": compact_mapping(
+            {
+                "path": container_path,
+                "image": identity_container.get("image"),
+                "frameworks": identity.get("frameworks"),
+            }
+        ),
+    }
+    if output_path:
+        site["output"] = {"path": output_path}
+
+    mounts: list[str] = []
+    for host_path, container_path_value in (cluster.get("default_mounts") or {}).items():
+        mounts.append(f"{host_path}:{container_path_value}")
+    mounts.extend(recipe.get("extra_mount") or [])
+    if mounts:
+        site["mounts"] = mounts
+
+    # Put site after name for readability.
+    result: dict[str, Any] = {}
+    if "name" in migrated:
+        result["name"] = migrated.pop("name")
+    result["site"] = site
+    result.update(migrated)
+    return result
+
+
+def compact_mapping(data: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in data.items() if value not in (None, {}, [], ())}
+
+
+def copy_without_keys(data: dict[str, Any], keys: set[str]) -> dict[str, Any]:
+    return {key: copy.deepcopy(value) for key, value in data.items() if key not in keys}
+
+
+def migrate_site_cmd(recipe_path: Path, srtslurm_path: Path, site_name: str, output: Path | None, stdout: bool) -> None:
+    migrated = migrate_site_config(recipe_path, srtslurm_path, site_name)
+    text = yaml.dump(migrated, default_flow_style=False, sort_keys=False)
+    if stdout:
+        print(text, end="")
+        return
+    output_path = output or recipe_path.with_name(f"{recipe_path.stem}.site{recipe_path.suffix}")
+    output_path.write_text(text)
+    console.print(f"[green]Wrote:[/] {output_path}")
+
+
 def main():
     # If no args at all, launch interactive mode
     if len(sys.argv) == 1:
@@ -1094,6 +1231,7 @@ def main():
   srtctl dry-run -f config.yaml                  # Dry run
   srtctl resolve-override -f config.yaml         # Resolve override YAML (no submit)
   srtctl resolve-override -f config.yaml --stdout  # Print to stdout
+  srtctl migrate-site -f config.yaml --srtslurm srtslurm.yaml --site-name lyris
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1162,6 +1300,16 @@ def main():
         help="Print resolved YAML to stdout instead of writing files",
     )
 
+    migrate_parser = subparsers.add_parser(
+        "migrate-site",
+        help="Convert a legacy recipe + srtslurm.yaml into a self-contained site recipe",
+    )
+    migrate_parser.add_argument("-f", "--file", type=Path, required=True, dest="config", help="Legacy recipe YAML")
+    migrate_parser.add_argument("--srtslurm", type=Path, required=True, help="Path to legacy srtslurm.yaml")
+    migrate_parser.add_argument("--site-name", type=str, required=True, help="Name for the generated site block")
+    migrate_parser.add_argument("-o", "--output", type=Path, help="Output path for migrated recipe")
+    migrate_parser.add_argument("--stdout", action="store_true", help="Print migrated YAML to stdout")
+
     # Fingerprint comparison: srtctl diff <path_a> <path_b>
     diff_parser = subparsers.add_parser("diff", help="Compare fingerprints from two runs")
     diff_parser.add_argument("path_a", type=Path, help="First output dir or lockfile")
@@ -1190,6 +1338,16 @@ def main():
     _mock_patch_teardowns: list = []
     if mock_mode:
         _mock_patch_teardowns = _install_mock_submit_patches()
+
+    if args.command == "migrate-site":
+        if not args.config.exists():
+            console.print(f"[bold red]Config not found:[/] {args.config}")
+            sys.exit(1)
+        if not args.srtslurm.exists():
+            console.print(f"[bold red]srtslurm.yaml not found:[/] {args.srtslurm}")
+            sys.exit(1)
+        migrate_site_cmd(args.config, args.srtslurm, args.site_name, args.output, args.stdout)
+        return
 
     # Handle diff and check commands first (they don't use -f/config)
     if args.command == "diff":

@@ -13,6 +13,8 @@ It captures everything needed to understand and reproduce a run:
 - lock.verification: identity checks (did runtime match declarations?)
 - lock.fingerprints: per-worker runtime environment (GPU, frameworks, packages)
 - lock.results: benchmark metrics (throughput, latency)
+- lock.hashes: exact recipe, portable intent, and site binding hashes
+- lock.artifacts: observed artifact metadata and relative file manifests
 
 The lockfile IS a valid recipe — `srtctl apply recipe.lock.yaml` works.
 When applying a lockfile, srtctl compares the new run against lock.fingerprints.
@@ -25,8 +27,10 @@ from __future__ import annotations
 import contextlib
 import getpass
 import hashlib
+import json
 import logging
 import os
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -42,6 +46,67 @@ logger = logging.getLogger(__name__)
 
 # Lockfile format version — bump when the structure changes
 _LOCKFILE_VERSION = 2
+_MAX_INLINE_HASH_BYTES = 64 * 1024 * 1024
+_MAX_MANIFEST_FILES = 20_000
+_MAX_MANIFEST_HASH_BYTES = 256 * 1024 * 1024
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _hash_record(value: str, *, status: str = "complete", **extra: Any) -> dict[str, Any]:
+    record = {
+        "algorithm": "sha256",
+        "status": status,
+    }
+    if status in {"complete", "partial"}:
+        record["value"] = hashlib.sha256(value.encode()).hexdigest()
+    record.update({k: v for k, v in extra.items() if v not in (None, {}, [], ())})
+    return record
+
+
+def _hash_data(data: Any, *, status: str = "complete", **extra: Any) -> dict[str, Any]:
+    canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
+    return _hash_record(canonical, status=status, **extra)
+
+
+def _file_hash_record(path: Path, *, max_bytes: int = _MAX_INLINE_HASH_BYTES) -> dict[str, Any]:
+    """Hash a regular file when cheap enough, always returning an explicit status."""
+    try:
+        resolved = path.resolve()
+        if not resolved.exists():
+            return _hash_record("", status="error", error=f"not found: {path}")
+        if resolved.is_dir():
+            return _hash_record("", status="skipped_directory")
+        if not resolved.is_file():
+            return _hash_record("", status="error", error=f"not a regular file: {path}")
+
+        size = resolved.stat().st_size
+        if size > max_bytes:
+            return _hash_record(
+                "",
+                status="skipped_large_file",
+                size_bytes=size,
+                max_inline_bytes=max_bytes,
+            )
+        return {
+            "algorithm": "sha256",
+            "status": "complete",
+            "value": _sha256_file(resolved),
+            "size_bytes": size,
+        }
+    except Exception as e:
+        return _hash_record("", status="error", error=str(e))
+
+
+def _hash_text(text: str) -> dict[str, Any]:
+    return _hash_record(text, status="complete", size_bytes=len(text.encode()))
+
 
 # Comment inserted above the lock section
 _LOCK_COMMENT = """\
@@ -51,7 +116,7 @@ _LOCK_COMMENT = """\
 #
 # This records exactly what happened when this recipe was executed.
 # To reproduce on another cluster:
-#   1. Ensure your srtslurm.yaml has the same model/container aliases
+#   1. Update the recipe's site: paths for that cluster, if needed
 #   2. Run: srtctl apply -f this-file.lock.yaml
 #   3. srtctl will compare your runtime against the original fingerprints
 #
@@ -130,10 +195,589 @@ def collect_worker_fingerprints(log_dir: Path) -> dict[str, Any] | None:
     return result if result else None
 
 
+def _compact_dict(data: dict[str, Any]) -> dict[str, Any]:
+    """Drop None/empty values for readable lockfile sections."""
+    return {k: v for k, v in data.items() if v not in (None, {}, [], ())}
+
+
+def _path_metadata(path_str: str | None, *, hash_files: bool = True) -> dict[str, Any]:
+    """Cheap, non-blocking path manifest used for lockfile artifacts."""
+    if not path_str:
+        return {}
+    expanded = os.path.expandvars(path_str)
+    if expanded.startswith("hf:"):
+        return {"path": expanded, "kind": "huggingface_id", "exists": None}
+
+    path = Path(expanded)
+    try:
+        resolved = path.resolve()
+        meta: dict[str, Any] = {"path": str(resolved), "exists": resolved.exists()}
+        if not resolved.exists():
+            return meta
+        stat = resolved.stat()
+        meta["mtime_ns"] = stat.st_mtime_ns
+        if resolved.is_dir():
+            meta["kind"] = "directory"
+            if hash_files:
+                meta["hash"] = _hash_record("", status="skipped_directory")
+        elif resolved.is_file():
+            meta["kind"] = "file"
+            meta["size_bytes"] = stat.st_size
+            if hash_files:
+                meta["hash"] = _file_hash_record(resolved)
+        else:
+            meta["kind"] = "other"
+        return meta
+    except Exception as e:
+        return {"path": expanded, "exists": "unknown", "error": str(e)}
+
+
+def _iter_files_deterministic(root: Path):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for filename in sorted(filenames):
+            path = Path(dirpath) / filename
+            if path.is_file():
+                yield path
+
+
+def _relative_file_manifest(path_str: str | None) -> dict[str, Any]:
+    """Build a path-independent manifest for a file tree.
+
+    The manifest hash deliberately excludes the absolute root path. Large files
+    are listed by relative path and size, but not content-hashed by default.
+    """
+    if not path_str:
+        return {"hash": _hash_record("", status="error", error="missing path")}
+    expanded = os.path.expandvars(path_str)
+    if expanded.startswith("hf:"):
+        return {
+            "kind": "huggingface_id",
+            "hash": _hash_record("", status="skipped_directory", reason="remote HuggingFace ID"),
+        }
+
+    root = Path(expanded)
+    try:
+        resolved = root.resolve()
+        if not resolved.exists():
+            return {"hash": _hash_record("", status="error", error=f"not found: {expanded}")}
+
+        if resolved.is_file():
+            files = iter([resolved])
+            base = resolved.parent
+            kind = "file"
+        elif resolved.is_dir():
+            files = _iter_files_deterministic(resolved)
+            base = resolved
+            kind = "directory"
+        else:
+            return {"hash": _hash_record("", status="error", error=f"unsupported path kind: {expanded}")}
+
+        entries: list[dict[str, Any]] = []
+        total_files_seen = 0
+        total_bytes = 0
+        hashed_bytes = 0
+        partial = False
+        truncated = False
+
+        for file_path in files:
+            total_files_seen += 1
+            if len(entries) >= _MAX_MANIFEST_FILES:
+                partial = True
+                truncated = True
+                break
+
+            stat = file_path.stat()
+            rel_path = file_path.relative_to(base).as_posix()
+            total_bytes += stat.st_size
+            entry: dict[str, Any] = {
+                "path": rel_path,
+                "size_bytes": stat.st_size,
+            }
+
+            if stat.st_size > _MAX_INLINE_HASH_BYTES:
+                entry["hash"] = _hash_record(
+                    "",
+                    status="skipped_large_file",
+                    size_bytes=stat.st_size,
+                    max_inline_bytes=_MAX_INLINE_HASH_BYTES,
+                )
+                partial = True
+            elif hashed_bytes + stat.st_size > _MAX_MANIFEST_HASH_BYTES:
+                entry["hash"] = _hash_record(
+                    "",
+                    status="partial",
+                    reason="manifest hash byte budget exceeded",
+                    max_manifest_hash_bytes=_MAX_MANIFEST_HASH_BYTES,
+                )
+                partial = True
+            else:
+                entry["hash"] = _file_hash_record(file_path)
+                hashed_bytes += stat.st_size
+
+            entries.append(entry)
+
+        payload = {
+            "kind": kind,
+            "entries": entries,
+            "truncated": truncated,
+        }
+        status = "partial" if partial else "complete"
+        return {
+            "kind": kind,
+            "file_count": len(entries),
+            "total_files_seen": total_files_seen,
+            "total_bytes": total_bytes,
+            "entries": entries,
+            "hash": _hash_data(
+                payload,
+                status=status,
+                file_count=len(entries),
+                total_files_seen=total_files_seen,
+                total_bytes=total_bytes,
+                truncated=truncated,
+            ),
+        }
+    except Exception as e:
+        return {"hash": _hash_record("", status="error", error=str(e))}
+
+
+def _infer_hf_metadata(path_str: str | None) -> dict[str, Any]:
+    """Infer HuggingFace identity from common local download metadata files."""
+    if not path_str or path_str.startswith("hf:"):
+        return {"hf_repo": path_str[3:]} if path_str and path_str.startswith("hf:") else {}
+
+    path = Path(os.path.expandvars(path_str))
+    if not path.exists() or not path.is_dir():
+        return {}
+
+    info: dict[str, Any] = {}
+    for refs_path in [path / ".huggingface" / "refs" / "main", path / "refs" / "main"]:
+        with contextlib.suppress(Exception):
+            if refs_path.exists():
+                info["revision"] = refs_path.read_text().strip()
+                break
+
+    if "revision" not in info:
+        cache_dl = path / ".cache" / "huggingface" / "download"
+        if cache_dl.is_dir():
+            for meta_file in sorted(cache_dl.glob("*.metadata")):
+                with contextlib.suppress(Exception):
+                    first_line = meta_file.read_text().splitlines()[0].strip()
+                    if len(first_line) == 40 and all(c in "0123456789abcdef" for c in first_line):
+                        info["revision"] = first_line
+                        break
+
+    meta_json = path / ".huggingface" / "download_metadata.json"
+    with contextlib.suppress(Exception):
+        if meta_json.exists():
+            metadata = json.loads(meta_json.read_text())
+            if metadata.get("repo_id"):
+                info["hf_repo"] = metadata["repo_id"]
+            if metadata.get("commit_hash"):
+                info["revision"] = metadata["commit_hash"]
+
+    config_json = path / "config.json"
+    with contextlib.suppress(Exception):
+        if config_json.exists():
+            config_data = json.loads(config_json.read_text())
+            if config_data.get("_name_or_path"):
+                info.setdefault("model_id", config_data["_name_or_path"])
+
+    return info
+
+
+def _first_worker_frameworks(worker_fingerprints: dict[str, Any] | None) -> dict[str, str]:
+    if not worker_fingerprints:
+        return {}
+    for fingerprint in worker_fingerprints.values():
+        frameworks = fingerprint.get("frameworks")
+        if isinstance(frameworks, dict):
+            return frameworks
+    return {}
+
+
+def _frameworks_by_worker(worker_fingerprints: dict[str, Any] | None) -> dict[str, Any]:
+    if not worker_fingerprints:
+        return {}
+    result = {}
+    for worker, fingerprint in worker_fingerprints.items():
+        frameworks = fingerprint.get("frameworks")
+        if isinstance(frameworks, dict):
+            result[worker] = frameworks
+    return result
+
+
+def _strip_empty(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: cleaned for k, v in value.items() if (cleaned := _strip_empty(v)) not in (None, {}, [], ())}
+    if isinstance(value, list):
+        return [cleaned for v in value if (cleaned := _strip_empty(v)) not in (None, {}, [], ())]
+    if isinstance(value, tuple):
+        return [_strip_empty(v) for v in value]
+    return value
+
+
+def _mount_target(mount_spec: str) -> str:
+    return mount_spec.split(":", 1)[1] if ":" in mount_spec else mount_spec
+
+
+def _normalized_intent_payload(config: SrtConfig) -> dict[str, Any]:
+    """Hashable config intent with cluster-local site bindings removed."""
+    from srtctl.core.schema import SrtConfig
+
+    data = SrtConfig.Schema().dump(config)
+    data.pop("lock", None)
+    data.pop("slurm", None)
+    data.pop("output", None)
+
+    site = data.get("site")
+    if isinstance(site, dict):
+        site_intent: dict[str, Any] = {}
+        model = site.get("model") or {}
+        if model:
+            site_intent["model"] = {k: model.get(k) for k in ("hf_repo", "revision", "precision")}
+
+        spec = site.get("speculative_model") or {}
+        if spec:
+            site_intent["speculative_model"] = {k: spec.get(k) for k in ("target", "hf_repo", "revision")}
+
+        container = site.get("container") or {}
+        if container:
+            site_intent["container"] = {k: container.get(k) for k in ("image", "digest", "frameworks")}
+
+        mounts = site.get("mounts") or []
+        if mounts:
+            site_intent["mount_targets"] = sorted(_mount_target(mount_spec) for mount_spec in mounts)
+
+        data["site"] = site_intent
+        # model is synthesized from site.model.path/site.container.path for
+        # internal compatibility, so it is deliberately excluded from intent.
+        data.pop("model", None)
+        # identity is also synthesized from site metadata; keeping it would make
+        # the intent hash depend on compatibility plumbing.
+        data.pop("identity", None)
+
+        extra_mount = data.pop("extra_mount", None)
+        if extra_mount:
+            data["extra_mount_targets"] = sorted(_mount_target(mount_spec) for mount_spec in extra_mount)
+
+        container_mounts = data.pop("container_mounts", None)
+        if container_mounts:
+            data["container_mount_targets"] = sorted(str(target) for target in container_mounts.values())
+
+    return _strip_empty(data)
+
+
+def _site_binding_payload(config: SrtConfig) -> dict[str, Any]:
+    """Hashable cluster-local site binding payload."""
+    if not config.site:
+        return {}
+
+    site = config.site
+    binding: dict[str, Any] = {
+        "name": site.name,
+        "slurm": {
+            "account": site.slurm.account,
+            "partition": site.slurm.partition,
+            "time_limit": site.slurm.time_limit,
+            "network_interface": site.slurm.network_interface,
+            "use_gpus_per_node_directive": site.slurm.use_gpus_per_node_directive,
+            "use_segment_sbatch_directive": site.slurm.use_segment_sbatch_directive,
+            "use_exclusive_sbatch_directive": site.slurm.use_exclusive_sbatch_directive,
+        },
+        "output": {"path": site.output.path},
+        "model": {"path": site.model.path if site.model else None},
+        "container": {"path": site.container.path if site.container else None},
+        "mounts": list(site.mounts or ()),
+    }
+    if site.speculative_model:
+        binding["speculative_model"] = {
+            "path": site.speculative_model.path,
+            "target": site.speculative_model.target,
+        }
+    if config.extra_mount:
+        binding["extra_mount"] = list(config.extra_mount)
+    if config.container_mounts:
+        binding["container_mounts"] = {str(host): str(target) for host, target in config.container_mounts.items()}
+    return _strip_empty(binding)
+
+
+def _hashes_section(config: SrtConfig, recipe_text: str | None) -> dict[str, Any]:
+    hashes: dict[str, Any] = {
+        "normalized_intent": _hash_data(
+            _normalized_intent_payload(config),
+            status="complete",
+            payload_version=1,
+        )
+    }
+    if recipe_text is not None:
+        hashes["recipe_exact"] = _hash_text(recipe_text)
+    if config.site:
+        hashes["site_binding"] = _hash_data(
+            _site_binding_payload(config),
+            status="complete",
+            payload_version=1,
+        )
+    return hashes
+
+
+def _run_git(source_dir: Path, *args: str, timeout: int = 5) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(source_dir), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        return None
+    return None
+
+
+def _source_root() -> Path:
+    env_source = os.environ.get("SRTCTL_SOURCE_DIR")
+    if env_source:
+        return Path(env_source)
+    return Path(__file__).resolve().parents[3]
+
+
+def _git_state(source_dir: Path) -> dict[str, Any]:
+    commit = _run_git(source_dir, "rev-parse", "HEAD")
+    if not commit:
+        return {"source_dir": str(source_dir), "hash": _hash_record("", status="error", error="not a git checkout")}
+
+    status = _run_git(source_dir, "status", "--porcelain=v1", "--untracked-files=normal") or ""
+    dirty = bool(status)
+    diff = _run_git(source_dir, "diff", "--binary", "HEAD", "--", ".", timeout=10)
+    if diff is None:
+        dirty_hash = _hash_record("", status="error", error="git diff failed")
+    else:
+        dirty_hash = _hash_text(status + "\n" + diff)
+        if dirty:
+            dirty_hash["status"] = "partial"
+            dirty_hash["coverage"] = "tracked diff plus untracked file names"
+
+    return {
+        "source_dir": str(source_dir),
+        "commit": commit,
+        "dirty": dirty,
+        "dirty_tree_hash": dirty_hash,
+    }
+
+
+def _runtime_file_record(path: Path, root: Path | None = None) -> dict[str, Any]:
+    record: dict[str, Any] = {"path": str(path)}
+    if root:
+        with contextlib.suppress(Exception):
+            record["relative_path"] = path.relative_to(root).as_posix()
+    record["hash"] = _file_hash_record(path)
+    return record
+
+
+def _find_setup_script(name: str) -> Path | None:
+    candidates = [
+        _source_root() / "configs" / name,
+        Path(__file__).resolve().parents[3] / "configs" / name,
+        Path("/configs") / name,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _runtime_code_artifacts(config: SrtConfig, output_dir: Path | None, log_dir: Path | None) -> dict[str, Any]:
+    source_dir = _source_root()
+    runtime: dict[str, Any] = {
+        "srtctl": _git_state(source_dir),
+    }
+
+    files: dict[str, Any] = {}
+    if output_dir:
+        files["submitted_config"] = _runtime_file_record(output_dir / "config.yaml", output_dir)
+        files["sbatch_script"] = _runtime_file_record(output_dir / "sbatch_script.sh", output_dir)
+        runtime_configs = [
+            _runtime_file_record(path, output_dir)
+            for path in sorted(output_dir.glob("config_*.yaml"))
+            if path.name != "config.yaml"
+        ]
+        if runtime_configs:
+            files["runtime_configs"] = runtime_configs
+
+    if log_dir:
+        generated_configs = [_runtime_file_record(path, log_dir) for path in sorted(log_dir.glob("*.yaml"))]
+        if generated_configs:
+            files["generated_runtime_configs"] = generated_configs
+
+    if config.setup_script:
+        setup_path = _find_setup_script(config.setup_script)
+        if setup_path:
+            files["setup_script"] = {
+                "name": config.setup_script,
+                **_runtime_file_record(setup_path),
+            }
+        else:
+            files["setup_script"] = {
+                "name": config.setup_script,
+                "hash": _hash_record("", status="error", error="setup script not found"),
+            }
+
+    if files:
+        runtime["files"] = files
+    return runtime
+
+
+def _mount_manifest(mount_spec: str) -> dict[str, Any]:
+    if ":" not in mount_spec:
+        return {"spec": mount_spec, "error": "expected host:container"}
+    source, target = mount_spec.split(":", 1)
+    return {
+        "source": source,
+        "target": target,
+        "observed": _path_metadata(source),
+        "manifest": _relative_file_manifest(source),
+    }
+
+
+def build_artifacts_section(
+    config: SrtConfig,
+    worker_fingerprints: dict[str, Any] | None,
+    resolved_log_dir: Path | None = None,
+    output_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Build declared/observed artifact metadata for reproducibility."""
+    site = config.site
+    artifacts: dict[str, Any] = {}
+
+    if site and site.model:
+        declared = _compact_dict(
+            {
+                "path": site.model.path,
+                "hf_repo": site.model.hf_repo,
+                "revision": site.model.revision,
+                "precision": site.model.precision,
+            }
+        )
+        artifacts["model"] = {
+            "declared": declared,
+            "observed": _compact_dict(
+                {
+                    **_path_metadata(site.model.path),
+                    **_infer_hf_metadata(site.model.path),
+                }
+            ),
+            "manifest": _relative_file_manifest(site.model.path),
+        }
+    else:
+        legacy_identity = config.identity.model if config.identity else None
+        artifacts["model"] = {
+            "declared": _compact_dict(
+                {
+                    "path": config.model.path,
+                    "hf_repo": getattr(legacy_identity, "repo", None),
+                    "revision": getattr(legacy_identity, "revision", None),
+                    "precision": config.model.precision,
+                }
+            ),
+            "observed": _compact_dict(
+                {
+                    **_path_metadata(config.model.path),
+                    **_infer_hf_metadata(config.model.path),
+                }
+            ),
+            "manifest": _relative_file_manifest(config.model.path),
+        }
+
+    if site and site.speculative_model:
+        spec = site.speculative_model
+        artifacts["speculative_model"] = {
+            "declared": _compact_dict(
+                {
+                    "path": spec.path,
+                    "target": spec.target,
+                    "hf_repo": spec.hf_repo,
+                    "revision": spec.revision,
+                }
+            ),
+            "observed": _compact_dict(
+                {
+                    **_path_metadata(spec.path),
+                    **_infer_hf_metadata(spec.path),
+                }
+            ),
+            "manifest": _relative_file_manifest(spec.path),
+        }
+
+    container_declared: dict[str, Any]
+    if site and site.container:
+        container_declared = _compact_dict(
+            {
+                "path": site.container.path,
+                "image": site.container.image,
+                "digest": site.container.digest,
+            }
+        )
+        declared_frameworks = site.container.frameworks
+    else:
+        legacy_container = config.identity.container if config.identity else None
+        container_declared = _compact_dict(
+            {
+                "path": config.model.container,
+                "image": getattr(legacy_container, "image", None),
+            }
+        )
+        declared_frameworks = config.identity.frameworks if config.identity else {}
+
+    artifacts["container"] = {
+        "declared": container_declared,
+        "observed": _path_metadata(config.model.container, hash_files=False),
+    }
+
+    observed_frameworks = _first_worker_frameworks(worker_fingerprints)
+    frameworks_by_worker = _frameworks_by_worker(worker_fingerprints)
+    if declared_frameworks or observed_frameworks or frameworks_by_worker:
+        artifacts["frameworks"] = _compact_dict(
+            {
+                "declared": declared_frameworks,
+                "observed": observed_frameworks,
+                "by_worker": frameworks_by_worker,
+            }
+        )
+
+    mounts: list[dict[str, Any]] = []
+    if site and site.mounts:
+        mounts.extend(_mount_manifest(mount_spec) for mount_spec in site.mounts)
+    if config.extra_mount:
+        mounts.extend(_mount_manifest(mount_spec) for mount_spec in config.extra_mount)
+    if mounts:
+        artifacts["mounts"] = mounts
+
+    output_declared = {}
+    if site and site.output.path:
+        output_declared["base_path"] = site.output.path
+    if resolved_log_dir:
+        output_artifact: dict[str, Any] = {"observed": _path_metadata(str(resolved_log_dir))}
+        if output_declared:
+            output_artifact["declared"] = output_declared
+        artifacts["output"] = output_artifact
+    elif output_declared:
+        artifacts["output"] = {"declared": output_declared}
+
+    artifacts["runtime_code"] = _runtime_code_artifacts(config, output_dir, resolved_log_dir)
+
+    return artifacts
+
+
 def build_lock_section(
     config: SrtConfig,
     worker_fingerprints: dict[str, Any] | None = None,
     resolved_log_dir: Path | None = None,
+    output_dir: Path | None = None,
+    recipe_text: str | None = None,
     verification: list[Any] | None = None,
     results: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -143,6 +787,8 @@ def build_lock_section(
         config: The resolved SrtConfig.
         worker_fingerprints: Per-worker fingerprints keyed by worker name.
         resolved_log_dir: Actual log directory path (resolved from template).
+        output_dir: Run output directory containing config/sbatch/runtime files.
+        recipe_text: Exact preserved recipe text above the lock section.
         verification: List of IdentityCheckResult from verify_identity().
         results: Benchmark results from rollup (if available).
     """
@@ -179,6 +825,9 @@ def build_lock_section(
         "model_path": config.model.path,
         "container_path": config.model.container,
     }
+    if config.site and config.site.speculative_model:
+        resolved["speculative_model_path"] = config.site.speculative_model.path
+        resolved["speculative_model_target"] = config.site.speculative_model.target
     if resolved_log_dir:
         resolved["log_dir"] = str(resolved_log_dir)
 
@@ -188,6 +837,17 @@ def build_lock_section(
         "slurm": collect_slurm_context(),
         "resolved": resolved,
     }
+
+    hashes = _hashes_section(config, recipe_text)
+    if hashes:
+        lock["hashes"] = hashes
+
+    if config.site:
+        lock["site"] = _compact_dict({"name": config.site.name})
+
+    artifacts = build_artifacts_section(config, worker_fingerprints, resolved_log_dir, output_dir)
+    if artifacts:
+        lock["artifacts"] = artifacts
 
     if verification_dict:
         lock["verification"] = verification_dict
@@ -228,6 +888,7 @@ def write_lockfile(
             config_dict = SrtConfig.Schema().dump(config)
             config_dict.pop("lock", None)
             recipe_text = yaml.dump(config_dict, default_flow_style=False, sort_keys=False)
+        preserved_recipe_text = recipe_text.rstrip()
 
         # Build the lock section
         fingerprints = collect_worker_fingerprints(log_dir) if log_dir else None
@@ -235,6 +896,8 @@ def write_lockfile(
             config,
             fingerprints,
             resolved_log_dir=log_dir,
+            output_dir=output_dir,
+            recipe_text=preserved_recipe_text,
             verification=verification,
             results=results,
         )
@@ -245,7 +908,7 @@ def write_lockfile(
 
         # Append lock section to recipe
         lock_yaml = yaml.dump({"lock": lock_data}, default_flow_style=False, sort_keys=False)
-        lockfile_text = recipe_text.rstrip() + "\n" + _LOCK_COMMENT + lock_yaml
+        lockfile_text = preserved_recipe_text + "\n" + _LOCK_COMMENT + lock_yaml
 
         lockfile_path = output_dir / "recipe.lock.yaml"
         lockfile_path.write_text(lockfile_text)
