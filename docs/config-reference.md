@@ -5,6 +5,7 @@ Complete reference for job configuration YAML files.
 ## Table of Contents
 
 - [Overview](#overview)
+- [schema_version](#schema_version)
 - [site](#site)
 - [Lockfile Hashes](#lockfile-hashes)
 - [Legacy Cluster Config Discovery](#legacy-cluster-config-discovery)
@@ -38,6 +39,7 @@ Complete reference for job configuration YAML files.
 
 ```yaml
 name: "my-benchmark"           # Required: job name
+schema_version: 2              # Required for new site-based recipes
 
 site:                          # Required for new self-contained recipes
   name: "lyris"
@@ -99,13 +101,27 @@ setup_script: "my-setup.sh"    # Optional: custom setup script
 
 ---
 
+## schema_version
+
+`schema_version` identifies the recipe API, not the generated lockfile format.
+
+| Value | Meaning |
+| ----- | ------- |
+| `1` | Legacy recipe API: top-level `model:` plus optional `srtslurm.yaml` alias/default resolution. Omitted `schema_version` defaults to `1` for recipes without `site:`. |
+| `2` | Self-contained site recipe API: explicit `site:` block with model, container, output, SLURM, and mount bindings. New reproducible recipes should set `schema_version: 2`. |
+
+During the transition, an unversioned recipe with `site:` is treated as schema version 2 for compatibility, but new and migrated recipes should write the field explicitly. `lock.version` inside `outputs/<job_id>/reproduce/recipe.lock.yaml` is separate and describes the generated reproducibility payload.
+
+---
+
 ## site
 
-`site:` is the canonical place where a recipe binds to a cluster. A new recipe should put cluster-specific paths, SLURM settings, model/container metadata, output path, and regular mounts here. This keeps the recipe self-contained instead of splitting reproducibility data across a recipe plus `srtslurm.yaml`.
+`site:` is the canonical v2 place where a recipe binds to a cluster. A new recipe should put cluster-specific paths, SLURM settings, model/container metadata, output path, and regular mounts here. This keeps the recipe self-contained instead of splitting reproducibility data across a recipe plus `srtslurm.yaml`.
 
 Minimal runnable form:
 
 ```yaml
+schema_version: 2
 site:
   model:
     path: "/lustre/.../models/deepseek-r1"
@@ -116,6 +132,7 @@ site:
 Careful reproducibility form:
 
 ```yaml
+schema_version: 2
 site:
   name: "lyris"
   slurm:

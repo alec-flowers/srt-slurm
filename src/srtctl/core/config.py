@@ -22,7 +22,13 @@ import yaml
 from ruamel.yaml.comments import CommentedMap
 
 from .lockfile import verify_lock_integrity
-from .schema import ClusterConfig, SrtConfig
+from .schema import (
+    LEGACY_RECIPE_SCHEMA_VERSION,
+    RECIPE_SCHEMA_VERSION,
+    SUPPORTED_RECIPE_SCHEMA_VERSIONS,
+    ClusterConfig,
+    SrtConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +36,43 @@ _SITE_MODEL_CONFLICT = (
     "Recipes using 'site:' must move model/container fields under site.model and site.container; "
     "remove the legacy top-level 'model:' block."
 )
+
+
+def _coerce_schema_version(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("schema_version must be an integer: 1 or 2")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    raise ValueError("schema_version must be an integer: 1 or 2")
+
+
+def normalize_recipe_schema_version(user_config: dict[str, Any]) -> dict[str, Any]:
+    """Validate and default the top-level recipe schema version."""
+    config = copy.deepcopy(user_config)
+    schema_version = _coerce_schema_version(config.get("schema_version"))
+    has_site = config.get("site") is not None
+
+    if schema_version is None:
+        config["schema_version"] = RECIPE_SCHEMA_VERSION if has_site else LEGACY_RECIPE_SCHEMA_VERSION
+        return config
+
+    if schema_version not in SUPPORTED_RECIPE_SCHEMA_VERSIONS:
+        supported = ", ".join(str(version) for version in SUPPORTED_RECIPE_SCHEMA_VERSIONS)
+        raise ValueError(f"Unsupported schema_version {schema_version}; supported versions: {supported}")
+
+    if schema_version == LEGACY_RECIPE_SCHEMA_VERSION and has_site:
+        raise ValueError("schema_version: 2 is required for recipes using site:")
+    if schema_version == RECIPE_SCHEMA_VERSION and not has_site:
+        raise ValueError(
+            "schema_version: 2 recipes must use site:; legacy top-level model recipes are schema_version: 1"
+        )
+
+    config["schema_version"] = schema_version
+    return config
 
 
 def load_cluster_config() -> dict[str, Any] | None:
@@ -128,7 +171,7 @@ def normalize_site_config(user_config: dict[str, Any]) -> dict[str, Any]:
     existing runtime expects ``config.model``. This function synthesizes that
     compatibility layer before marshmallow validation.
     """
-    config = copy.deepcopy(user_config)
+    config = normalize_recipe_schema_version(user_config)
     site = config.get("site")
     if site is None:
         return config
@@ -179,7 +222,7 @@ def resolve_config_with_defaults(user_config: dict[str, Any], cluster_config: di
         Resolved config dict with all defaults applied
     """
     # Deep copy to avoid mutating original
-    config = copy.deepcopy(user_config)
+    config = normalize_recipe_schema_version(user_config)
 
     if config.get("site") is not None:
         return normalize_site_config(config)

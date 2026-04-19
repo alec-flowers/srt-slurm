@@ -1189,6 +1189,7 @@ def migrate_site_config(recipe_path: Path, srtslurm_path: Path, site_name: str) 
     result: dict[str, Any] = {}
     if "name" in migrated:
         result["name"] = migrated.pop("name")
+    result["schema_version"] = 2
     result["site"] = site
     result.update(migrated)
     return result

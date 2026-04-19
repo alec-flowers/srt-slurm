@@ -47,6 +47,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+LEGACY_RECIPE_SCHEMA_VERSION = 1
+RECIPE_SCHEMA_VERSION = 2
+SUPPORTED_RECIPE_SCHEMA_VERSIONS = (LEGACY_RECIPE_SCHEMA_VERSION, RECIPE_SCHEMA_VERSION)
+
 
 # ============================================================================
 # Reporting Configuration
@@ -1152,6 +1156,7 @@ class SrtConfig:
     name: str
     model: ModelConfig
     resources: ResourceConfig
+    schema_version: int = LEGACY_RECIPE_SCHEMA_VERSION
 
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
     backend: Annotated[BackendConfig, BackendConfigField()] = field(default_factory=SGLangProtocol)

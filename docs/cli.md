@@ -312,7 +312,7 @@ Dry-run output includes:
 
 ### `srtctl migrate-site`
 
-Convert a legacy recipe plus `srtslurm.yaml` aliases into a self-contained recipe with a `site:` block.
+Convert a legacy recipe plus `srtslurm.yaml` aliases into a self-contained recipe with `schema_version: 2` and a `site:` block.
 
 ```bash
 srtctl migrate-site -f <recipe.yaml> --srtslurm <srtslurm.yaml> --site-name <name> [options]

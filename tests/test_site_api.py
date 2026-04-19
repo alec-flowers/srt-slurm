@@ -51,6 +51,7 @@ def _site_paths(tmp_path: Path) -> dict[str, Path]:
 def _minimal_site_recipe(paths: dict[str, Path]) -> dict:
     return {
         "name": "site-job",
+        "schema_version": 2,
         "site": {
             "name": "lyris",
             "slurm": {
@@ -76,6 +77,7 @@ class TestSiteConfigLoading:
             config = load_config(recipe_path)
 
         assert config.site is not None
+        assert config.schema_version == 2
         assert config.site.name == "lyris"
         assert config.model.path == str(paths["model"])
         assert config.model.container == str(paths["container"])
@@ -83,6 +85,67 @@ class TestSiteConfigLoading:
         assert config.slurm.account == "site-account"
         assert config.slurm.partition == "site-partition"
         assert config.slurm.time_limit == "04:00:00"
+
+    def test_legacy_recipe_without_schema_version_defaults_to_v1(self, tmp_path):
+        paths = _site_paths(tmp_path)
+        recipe = {
+            "name": "legacy-job",
+            "model": {
+                "path": str(paths["model"]),
+                "container": str(paths["container"]),
+                "precision": "fp8",
+            },
+            "resources": _resources(),
+        }
+        recipe_path = _write_yaml(tmp_path, recipe)
+
+        with patch("srtctl.core.config.load_cluster_config", return_value=None):
+            config = load_config(recipe_path)
+
+        assert config.schema_version == 1
+        assert config.site is None
+
+    def test_unversioned_site_recipe_defaults_to_v2_during_transition(self, tmp_path):
+        paths = _site_paths(tmp_path)
+        recipe = _minimal_site_recipe(paths)
+        recipe.pop("schema_version")
+
+        config = load_config(_write_yaml(tmp_path, recipe))
+
+        assert config.schema_version == 2
+        assert config.site is not None
+
+    def test_schema_version_one_rejects_site_recipes(self, tmp_path):
+        paths = _site_paths(tmp_path)
+        recipe = _minimal_site_recipe(paths)
+        recipe["schema_version"] = 1
+
+        with pytest.raises(ValueError, match="schema_version: 2 is required"):
+            load_config(_write_yaml(tmp_path, recipe))
+
+    def test_schema_version_two_requires_site_block(self, tmp_path):
+        paths = _site_paths(tmp_path)
+        recipe = {
+            "name": "legacy-job",
+            "schema_version": 2,
+            "model": {
+                "path": str(paths["model"]),
+                "container": str(paths["container"]),
+                "precision": "fp8",
+            },
+            "resources": _resources(),
+        }
+
+        with pytest.raises(ValueError, match="schema_version: 2 recipes must use site"):
+            load_config(_write_yaml(tmp_path, recipe))
+
+    def test_unsupported_schema_version_is_rejected(self, tmp_path):
+        paths = _site_paths(tmp_path)
+        recipe = _minimal_site_recipe(paths)
+        recipe["schema_version"] = 99
+
+        with pytest.raises(ValueError, match="Unsupported schema_version 99"):
+            load_config(_write_yaml(tmp_path, recipe))
 
     def test_site_metadata_is_optional_but_populates_identity_when_declared(self, tmp_path):
         paths = _site_paths(tmp_path)
@@ -333,6 +396,7 @@ class TestMigrateSiteCommand:
         assert "model" not in migrated
         assert "identity" not in migrated
         assert "extra_mount" not in migrated
+        assert migrated["schema_version"] == 2
         assert migrated["site"]["name"] == "lyris"
         assert migrated["site"]["slurm"]["account"] == "recipe-account"
         assert migrated["site"]["slurm"]["partition"] == "batch"
