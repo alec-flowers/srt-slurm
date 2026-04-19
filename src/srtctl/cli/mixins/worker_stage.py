@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_FINGERPRINTS_CONTAINER_DIR = "/outputs/reproduce/fingerprints"
+
 
 class WorkerStageMixin:
     """Mixin for worker process startup stage.
@@ -197,7 +199,7 @@ class WorkerStageMixin:
 
         # Build bash preamble (setup script + dynamo install + fingerprint)
         bash_preamble = self._build_worker_preamble()
-        fp_cmd = generate_capture_script(f"/logs/fingerprint_{mode}_w{index}.json")
+        fp_cmd = generate_capture_script(f"{_FINGERPRINTS_CONTAINER_DIR}/fingerprint_{mode}_w{index}.json")
         # Keep fingerprint failures non-fatal, but do not let its `|| true`
         # mask failures from setup/dynamo install commands before it.
         fp_cmd = f"( {fp_cmd} )"
@@ -310,7 +312,7 @@ class WorkerStageMixin:
 
         # Build bash preamble (setup script + dynamo install + fingerprint)
         bash_preamble = self._build_worker_preamble()
-        fp_cmd = generate_capture_script(f"/logs/fingerprint_{mode}_w{index}.json")
+        fp_cmd = generate_capture_script(f"{_FINGERPRINTS_CONTAINER_DIR}/fingerprint_{mode}_w{index}.json")
         # Keep fingerprint failures non-fatal, but do not let its `|| true`
         # mask failures from setup/dynamo install commands before it.
         fp_cmd = f"( {fp_cmd} )"

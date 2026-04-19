@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from srtctl.core.fingerprint import format_identity_verification, verify_identity
 from srtctl.core.health import wait_for_model
-from srtctl.core.lockfile import collect_worker_fingerprints
+from srtctl.core.lockfile import collect_worker_fingerprints, fingerprints_dir
 from srtctl.core.slurm import get_hostname_ip, start_srun_process
 from srtctl.core.status import JobStage, JobStatus, StatusReporter
 
@@ -100,7 +100,7 @@ class BenchmarkStageMixin:
         # Store results on self so postprocess can include them in the lockfile
         self._identity_verification = None
         try:
-            fingerprints = collect_worker_fingerprints(self.runtime.log_dir)
+            fingerprints = collect_worker_fingerprints(fingerprints_dir(self.runtime.log_dir.parent))
             has_identity = self.config.identity and (
                 (
                     self.config.identity.model

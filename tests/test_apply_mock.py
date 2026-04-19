@@ -12,7 +12,6 @@ drives the real SweepOrchestrator under `srtctl.mock`.
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -114,7 +113,8 @@ def test_apply_mock_emits_submission_json_and_spawns_worker(
     # Orchestrator artifacts are also present.
     assert (output_dir / "status.json").exists()
     assert (output_dir / "status_events.jsonl").exists()
-    assert (output_dir / "recipe.lock.yaml").exists()
+    assert (output_dir / "reproduce" / "recipe.lock.yaml").exists()
+    assert (output_dir / "reproduce" / "fingerprints" / "fingerprint_agg_w0.json").exists()
     assert (output_dir / "logs" / "benchmark.out").exists()
 
 

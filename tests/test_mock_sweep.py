@@ -57,7 +57,8 @@ def test_run_mock_sweep_produces_expected_artifacts(tmp_path: Path) -> None:
     assert (output_dir / "status.json").is_file()
     assert (output_dir / "status_events.jsonl").is_file()
     assert (output_dir / "result.json").is_file()
-    assert (output_dir / "recipe.lock.yaml").is_file(), "lockfile written by real postprocess stage"
+    assert (output_dir / "reproduce" / "recipe.lock.yaml").is_file(), "lockfile written by real postprocess stage"
+    assert (output_dir / "reproduce" / "fingerprints" / "fingerprint_agg_w0.json").is_file()
     # Per-component logs emitted by the real orchestrator, via fake srun.
     assert (output_dir / "logs" / "infra.out").is_file()
     assert any((output_dir / "logs").glob("*_agg_w0.out")), "worker log written"

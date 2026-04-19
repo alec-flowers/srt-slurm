@@ -25,10 +25,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import requests
+import yaml
 
 from srtctl.benchmarks.base import SCRIPTS_DIR
 from srtctl.core.config import load_cluster_config
-from srtctl.core.lockfile import collect_worker_fingerprints, generate_reproduction_report, write_lockfile
+from srtctl.core.lockfile import (
+    collect_worker_fingerprints,
+    fingerprints_dir,
+    generate_reproduction_report,
+    lockfile_path,
+    reproduction_report_path,
+    write_lockfile,
+)
 from srtctl.core.schema import AIAnalysisConfig, S3Config
 from srtctl.core.slurm import start_srun_process
 
@@ -249,14 +257,25 @@ class PostProcessStageMixin:
             if not lock_data:
                 return
 
-            new_fps = collect_worker_fingerprints(self.runtime.log_dir)
+            output_dir = self.runtime.log_dir.parent
+            new_fps = collect_worker_fingerprints(fingerprints_dir(output_dir))
             if not new_fps:
                 return
+
+            new_artifacts = None
+            current_lockfile = lockfile_path(output_dir)
+            if current_lockfile.exists():
+                try:
+                    current_lock = yaml.safe_load(current_lockfile.read_text()) or {}
+                    new_artifacts = current_lock.get("lock", {}).get("artifacts")
+                except Exception as e:
+                    logger.debug("Current lockfile artifacts unavailable: %s", e)
 
             # TODO: pass benchmark results once rollup format is standardized
             summary_lines, report_lines, issues = generate_reproduction_report(
                 lock_data,
                 new_fps,
+                new_artifacts=new_artifacts,
             )
 
             # Log summary to sweep log
@@ -271,7 +290,8 @@ class PostProcessStageMixin:
 
             # Write full report to file
             if report_lines:
-                report_path = self.runtime.log_dir / "reproduction-report.txt"
+                report_path = reproduction_report_path(output_dir)
+                report_path.parent.mkdir(parents=True, exist_ok=True)
                 report_path.write_text("\n".join(report_lines) + "\n")
                 logger.info(f"Reproduction report: {report_path}")
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -219,10 +220,38 @@ def mock_infrastructure(*, options: MockOptions, output_dir: Path):
         }
     )
 
+    def _write_mock_fingerprints(bash_preamble: str | None) -> None:
+        if not bash_preamble:
+            return
+        names = sorted(
+            set(re.findall(r"/outputs/reproduce/fingerprints/(fingerprint_[A-Za-z0-9_-]+\.json)", bash_preamble))
+        )
+        for name in names:
+            worker = name.removeprefix("fingerprint_").removesuffix(".json")
+            fp_path = output_dir / "reproduce" / "fingerprints" / name
+            fp_path.parent.mkdir(parents=True, exist_ok=True)
+            fp_path.write_text(
+                json.dumps(
+                    {
+                        "hostname": options.nodelist[0],
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "arch": "mock",
+                        "python_version": "mock",
+                        "frameworks": {},
+                        "env": {},
+                        "pip_packages": {},
+                        "worker": worker,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+
     def _fake_srun(*args, **kwargs) -> FakePopen:
         cmd = kwargs.get("command") or (args[0] if args else [])
         if not isinstance(cmd, list):
             cmd = [str(cmd)]
+        _write_mock_fingerprints(kwargs.get("bash_preamble"))
         return FakePopen(
             cmd=cmd,
             output=kwargs.get("output"),

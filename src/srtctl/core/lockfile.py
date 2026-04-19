@@ -16,7 +16,7 @@ It captures everything needed to understand and reproduce a run:
 - lock.hashes: exact recipe, portable intent, and site binding hashes
 - lock.artifacts: observed artifact metadata and relative file manifests
 
-The lockfile IS a valid recipe — `srtctl apply recipe.lock.yaml` works.
+The lockfile IS a valid recipe — `srtctl apply -f reproduce/recipe.lock.yaml` works.
 When applying a lockfile, srtctl compares the new run against lock.fingerprints.
 
 All operations are fault-tolerant — lockfile writing never blocks or fails a job.
@@ -33,7 +33,7 @@ import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 
@@ -49,6 +49,30 @@ _LOCKFILE_VERSION = 2
 _MAX_INLINE_HASH_BYTES = 64 * 1024 * 1024
 _MAX_MANIFEST_FILES = 20_000
 _MAX_MANIFEST_HASH_BYTES = 256 * 1024 * 1024
+_REPRODUCE_DIR = "reproduce"
+_FINGERPRINTS_DIR = "fingerprints"
+_LOCKFILE_NAME = "recipe.lock.yaml"
+_REPRODUCTION_REPORT_NAME = "reproduction-report.txt"
+
+
+def reproduce_dir(output_dir: Path) -> Path:
+    """Directory for reproducibility artifacts within a run output."""
+    return output_dir / _REPRODUCE_DIR
+
+
+def lockfile_path(output_dir: Path) -> Path:
+    """Canonical lockfile path for a run output directory."""
+    return reproduce_dir(output_dir) / _LOCKFILE_NAME
+
+
+def fingerprints_dir(output_dir: Path) -> Path:
+    """Directory for raw per-worker fingerprint JSON files."""
+    return reproduce_dir(output_dir) / _FINGERPRINTS_DIR
+
+
+def reproduction_report_path(output_dir: Path) -> Path:
+    """Canonical reproduction report path for a run output directory."""
+    return reproduce_dir(output_dir) / _REPRODUCTION_REPORT_NAME
 
 
 def _sha256_file(path: Path) -> str:
@@ -117,7 +141,7 @@ _LOCK_COMMENT = """\
 # This records exactly what happened when this recipe was executed.
 # To reproduce on another cluster:
 #   1. Update the recipe's site: paths for that cluster, if needed
-#   2. Run: srtctl apply -f this-file.lock.yaml
+#   2. Run: srtctl apply -f reproduce/recipe.lock.yaml
 #   3. srtctl will compare your runtime against the original fingerprints
 #
 # The recipe above is unchanged from what the author wrote.
@@ -312,7 +336,11 @@ def _relative_file_manifest(path_str: str | None) -> dict[str, Any]:
                 )
                 partial = True
             else:
-                entry["hash"] = _file_hash_record(file_path)
+                file_hash = _file_hash_record(file_path)
+                file_hash.pop("size_bytes", None)
+                entry["hash"] = file_hash
+                if entry["hash"].get("status") != "complete":
+                    partial = True
                 hashed_bytes += stat.st_size
 
             entries.append(entry)
@@ -866,7 +894,7 @@ def write_lockfile(
     verification: list[Any] | None = None,
     results: dict[str, Any] | None = None,
 ) -> bool:
-    """Write recipe.lock.yaml — the original recipe with a lock: section appended.
+    """Write reproduce/recipe.lock.yaml with the original recipe and generated lock section.
 
     Called twice per job:
     1. At job start (log_dir=None) — writes recipe + lock with SLURM context
@@ -891,7 +919,7 @@ def write_lockfile(
         preserved_recipe_text = recipe_text.rstrip()
 
         # Build the lock section
-        fingerprints = collect_worker_fingerprints(log_dir) if log_dir else None
+        fingerprints = collect_worker_fingerprints(fingerprints_dir(output_dir)) if log_dir else None
         lock_data = build_lock_section(
             config,
             fingerprints,
@@ -910,9 +938,10 @@ def write_lockfile(
         lock_yaml = yaml.dump({"lock": lock_data}, default_flow_style=False, sort_keys=False)
         lockfile_text = preserved_recipe_text + "\n" + _LOCK_COMMENT + lock_yaml
 
-        lockfile_path = output_dir / "recipe.lock.yaml"
-        lockfile_path.write_text(lockfile_text)
-        logger.info("Wrote lockfile: %s", lockfile_path)
+        path = lockfile_path(output_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(lockfile_text)
+        logger.info("Wrote lockfile: %s", path)
         return True
     except Exception as e:
         logger.warning("Failed to write lockfile: %s", e)
@@ -923,22 +952,26 @@ def generate_reproduction_report(
     prev_lock: dict[str, Any],
     new_fingerprints: dict[str, Any],
     new_results: dict[str, Any] | None = None,
+    new_artifacts: dict[str, Any] | None = None,
 ) -> tuple[list[str], list[str], list[str]]:
     """Compare a new run's fingerprints against a previous lockfile's data.
 
     Compares per-worker: each worker in the previous run is matched against
     the same worker key in the new run. Detects added/removed workers and
-    per-worker environment differences.
+    per-worker environment differences. When current artifacts are provided,
+    also compares cheap manifest evidence so partial/skipped hashes still catch
+    model and mount drift.
 
     Args:
         prev_lock: The lock: section from the previous lockfile.
         new_fingerprints: Per-worker fingerprints from the new run.
         new_results: Benchmark rollup from the new run (optional).
+        new_artifacts: Current run's lock.artifacts section (optional).
 
     Returns:
         Tuple of (summary_lines, report_lines, issues).
         - summary_lines: short output for sweep log
-        - report_lines: full report for reproduction-report.txt
+        - report_lines: full report for reproduce/reproduction-report.txt
         - issues: list of problems found
     """
     import re
@@ -972,6 +1005,117 @@ def generate_reproduction_report(
         if not match:
             issues.append(f"{label}: {prev_s} -> {new_s}")
         return line
+
+    def _manifest_summary(manifest: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(manifest, dict):
+            return {}
+        raw_hash = manifest.get("hash")
+        hash_record = cast(dict[str, Any], raw_hash) if isinstance(raw_hash, dict) else {}
+        return _compact_dict(
+            {
+                "kind": manifest.get("kind"),
+                "hash_status": hash_record.get("status"),
+                "hash_value": hash_record.get("value"),
+                "file_count": manifest.get("file_count"),
+                "total_files_seen": manifest.get("total_files_seen"),
+                "total_bytes": manifest.get("total_bytes"),
+                "truncated": hash_record.get("truncated"),
+            }
+        )
+
+    def _artifact_manifest_map(artifacts: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+        if not isinstance(artifacts, dict):
+            return {}
+        manifests: dict[str, dict[str, Any]] = {}
+        for name in ["model", "speculative_model"]:
+            artifact = artifacts.get(name)
+            if isinstance(artifact, dict):
+                artifact_dict = cast(dict[str, Any], artifact)
+                summary = _manifest_summary(artifact_dict.get("manifest"))
+                if summary:
+                    manifests[name] = summary
+
+        mounts = artifacts.get("mounts")
+        if isinstance(mounts, list):
+            for idx, mount in enumerate(mounts):
+                if not isinstance(mount, dict):
+                    continue
+                mount_dict = cast(dict[str, Any], mount)
+                target = mount_dict.get("target") or f"mount[{idx}]"
+                summary = _manifest_summary(mount_dict.get("manifest"))
+                if summary:
+                    manifests[f"mount:{target}"] = summary
+        return manifests
+
+    def _format_manifest_value(value: Any) -> str:
+        if value is None:
+            return "?"
+        value_s = str(value)
+        return value_s[:12] if len(value_s) > 24 else value_s
+
+    def _compare_artifacts() -> None:
+        prev_artifacts = prev_lock.get("artifacts")
+        if not prev_artifacts:
+            return
+
+        report_lines.append("")
+        report_lines.append("Artifacts:")
+        if not new_artifacts:
+            report_lines.append("  -- current artifact manifests unavailable")
+            return
+
+        prev_manifests = _artifact_manifest_map(prev_artifacts)
+        new_manifests = _artifact_manifest_map(new_artifacts)
+        all_names = sorted(set(prev_manifests) | set(new_manifests))
+        if not all_names:
+            report_lines.append("  -- no comparable artifact manifests")
+            return
+
+        fields = ["kind", "hash_status", "file_count", "total_files_seen", "total_bytes", "truncated"]
+        for name in all_names:
+            prev_manifest = prev_manifests.get(name)
+            new_manifest = new_manifests.get(name)
+            if prev_manifest is None:
+                line = f"  !!  artifact {name}: added"
+                report_lines.append(line)
+                summary_lines.append(line)
+                issues.append(f"artifact {name}: added")
+                continue
+            if new_manifest is None:
+                line = f"  !!  artifact {name}: missing"
+                report_lines.append(line)
+                summary_lines.append(line)
+                issues.append(f"artifact {name}: missing")
+                continue
+
+            report_lines.append(f"  [{name}]")
+            for field in fields:
+                prev_val = prev_manifest.get(field)
+                new_val = new_manifest.get(field)
+                if prev_val is None and new_val is None:
+                    continue
+                prev_s = _format_manifest_value(prev_val)
+                new_s = _format_manifest_value(new_val)
+                if prev_val == new_val:
+                    report_lines.append(f"    OK  {field}: {prev_s} == {new_s}")
+                else:
+                    line = f"    !!  {field}: {prev_s} != {new_s}"
+                    report_lines.append(line)
+                    summary_lines.append(f"  !!  artifact {name} {field}: {prev_s} != {new_s}")
+                    issues.append(f"artifact {name} {field}: {prev_s} -> {new_s}")
+
+            prev_hash = prev_manifest.get("hash_value")
+            new_hash = new_manifest.get("hash_value")
+            if prev_hash and new_hash:
+                prev_s = _format_manifest_value(prev_hash)
+                new_s = _format_manifest_value(new_hash)
+                if prev_hash == new_hash:
+                    report_lines.append(f"    OK  manifest_hash: {prev_s} == {new_s}")
+                else:
+                    line = f"    !!  manifest_hash: {prev_s} != {new_s}"
+                    report_lines.append(line)
+                    summary_lines.append(f"  !!  artifact {name} manifest_hash: {prev_s} != {new_s}")
+                    issues.append(f"artifact {name} manifest_hash: {prev_s} -> {new_s}")
 
     def _compare_worker(
         worker: str,
@@ -1096,6 +1240,8 @@ def generate_reproduction_report(
         report_lines.append(f"[{worker}] ADDED (not in previous run)")
         issues.append(f"Worker {worker} added")
 
+    _compare_artifacts()
+
     # --- Results ---
     # TODO: compare benchmark results once rollup format is standardized.
 
@@ -1161,12 +1307,12 @@ def load_lockfile_fingerprints(path: Path) -> dict[str, Any] | None:
     """Load per-worker fingerprints from a lockfile, output directory, or raw JSON."""
     try:
         if path.is_dir():
-            lockfile = path / "recipe.lock.yaml"
+            lockfile = lockfile_path(path)
             if lockfile.exists():
                 return _load_fingerprints_from_lockfile(lockfile)
-            logs_dir = path / "logs"
-            if logs_dir.is_dir():
-                return collect_worker_fingerprints(logs_dir)
+            raw_dir = fingerprints_dir(path)
+            if raw_dir.is_dir():
+                return collect_worker_fingerprints(raw_dir)
             return collect_worker_fingerprints(path)
 
         if path.suffix in (".yaml", ".yml"):

@@ -80,12 +80,13 @@ def test_worker_stage_wraps_nonfatal_fingerprint_hook(tmp_path: Path) -> None:
     )
 
     with (
-        patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="fingerprint || true"),
+        patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="fingerprint || true") as mock_capture,
         patch("srtctl.cli.mixins.worker_stage.start_srun_process") as mock_srun,
     ):
         mock_srun.return_value = MagicMock()
         mixin.start_worker(process, [process])
 
+    mock_capture.assert_called_once_with("/outputs/reproduce/fingerprints/fingerprint_prefill_w0.json")
     bash_preamble = mock_srun.call_args.kwargs["bash_preamble"]
     assert "setup.sh" in bash_preamble
     assert bash_preamble.endswith("&& ( fingerprint || true )")

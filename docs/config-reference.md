@@ -168,13 +168,13 @@ site:
 
 If `site:` is present, do not also declare top-level `model:`. `srtctl` rejects mixed recipes with a clear migration error.
 
-Optional metadata never blocks submission. It is used for warn-only validation when detectable, and `recipe.lock.yaml` records declared metadata separately from observed/inferred metadata.
+Optional metadata never blocks submission. It is used for warn-only validation when detectable, and `reproduce/recipe.lock.yaml` records declared metadata separately from observed/inferred metadata.
 
 ---
 
 ## Lockfile Hashes
 
-`recipe.lock.yaml` keeps the submitted recipe body above `lock:` and appends reproducibility data. Normal recipes do not need a visible hashing policy; `srtctl` uses smart, non-blocking defaults.
+`outputs/<job_id>/reproduce/recipe.lock.yaml` keeps the submitted recipe body above `lock:` and appends reproducibility data. Raw per-worker runtime fingerprints are written under `outputs/<job_id>/reproduce/fingerprints/`. Normal recipes do not need a visible hashing policy; `srtctl` uses smart, non-blocking defaults.
 
 `lock.hashes` records:
 
@@ -187,6 +187,8 @@ Optional metadata never blocks submission. It is used for warn-only validation w
 `lock.artifacts` records relative manifests for `site.model`, `site.speculative_model`, and `site.mounts`. Manifest hashes do not include absolute host paths, so a recreated run can move to a different filesystem while preserving the artifact tree identity. Small files such as `config.json` and tokenizer metadata are hashed immediately; large model weights are listed by relative path and size and skipped by default.
 
 Every hash reports a status: `complete`, `partial`, `skipped_large_file`, `skipped_directory`, or `error`. Container content hashing is intentionally skipped for now; the lockfile records declared image/digest metadata and observed container file metadata.
+
+When a lockfile run is reproduced, srtctl also compares manifest summaries such as `file_count`, `total_files_seen`, and `total_bytes`, so skipped or partial content hashes still provide drift evidence without blocking the run.
 
 `lock.artifacts.runtime_code` records the generated sbatch script, submitted/resolved configs, generated runtime YAMLs, setup script, and the `srtctl` git commit plus dirty-tree hash when available.
 
@@ -1075,7 +1077,7 @@ output:
 # Mount user data into container
 container_mounts:
   "$HOME/datasets": "/datasets"
-  "./outputs/{job_id}": "/outputs"
+  "./outputs/{job_id}": "/job-output"
 
 # Custom paths with environment variables
 extra_mount:
@@ -1092,7 +1094,7 @@ Custom container mount mappings with FormattablePath support.
 ```yaml
 container_mounts:
   "$HOME/datasets": "/datasets"
-  "$HOME/outputs/{job_id}": "/outputs"
+  "$HOME/outputs/{job_id}": "/job-output"
   "/shared/cache": "/cache"
 ```
 
@@ -1109,6 +1111,7 @@ The following mounts are always added automatically:
 | Host Path              | Container Path       | Description                  |
 | ---------------------- | -------------------- | ---------------------------- |
 | Model path             | `/model`             | Resolved model directory     |
+| Run output directory   | `/outputs`           | Per-job output root          |
 | Log directory          | `/logs`              | Log output directory         |
 | `configs/` directory   | `/configs`           | NATS, etcd binaries          |
 | Benchmark scripts      | `/srtctl-benchmarks` | Bundled benchmark scripts    |

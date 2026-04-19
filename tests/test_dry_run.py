@@ -55,6 +55,7 @@ class TestDryRunMounts:
         show_config_details(config)
         output = capsys.readouterr().out
         assert "/model" in output
+        assert "/outputs" in output
         assert "/logs" in output
 
     def test_extra_mount_from_recipe(self, capsys):

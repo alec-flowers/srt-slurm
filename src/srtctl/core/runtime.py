@@ -171,6 +171,8 @@ class RuntimeContext:
             log_dir = log_dir_base / job_id / "logs"
         else:
             log_dir = log_dir_base / job_id / "logs"
+        output_dir = log_dir.parent
+        output_dir.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)
 
         # Resolve model path (expand env vars)
@@ -210,6 +212,7 @@ class RuntimeContext:
 
         # Build container mounts
         container_mounts: dict[Path, Path] = {
+            output_dir: Path("/outputs"),
             log_dir: Path("/logs"),
         }
         # Only mount local model paths - HF models are downloaded at runtime

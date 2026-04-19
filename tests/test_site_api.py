@@ -159,6 +159,8 @@ class TestSiteRuntime:
         assert runtime.model_path == paths["model"].resolve()
         assert runtime.container_image == paths["container"].resolve()
         assert runtime.network_interface == "ib0"
+        assert runtime.container_mounts[runtime.log_dir.parent] == Path("/outputs")
+        assert runtime.container_mounts[runtime.log_dir] == Path("/logs")
         assert runtime.container_mounts[paths["model"].resolve()] == Path("/model")
         assert runtime.container_mounts[paths["speculative_model"].resolve()] == Path("/speculative-model")
         assert runtime.container_mounts[paths["traces"].resolve()] == Path("/traces")
@@ -285,7 +287,7 @@ class TestSiteLockfileArtifacts:
         for recipe in (recipe_a, recipe_b):
             recipe["site"]["model"].update({"hf_repo": "nvidia/Kimi-K2.5-NVFP4", "revision": "abc123"})
             recipe["site"]["container"].update({"image": "registry.example/dynamo:tag"})
-            recipe["site"]["mounts"] = [f"{recipe['site']['output']['path']}:/outputs"]
+            recipe["site"]["mounts"] = [f"{recipe['site']['output']['path']}:/job-output"]
 
         lock_a = build_lock_section(load_config(_write_yaml(tmp_path, recipe_a, name="a.yaml")))
         lock_b = build_lock_section(load_config(_write_yaml(tmp_path, recipe_b, name="b.yaml")))

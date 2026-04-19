@@ -252,6 +252,27 @@ class TestPostProcessStageMixin:
 
         mixin._run_ai_analysis.assert_called_once_with(config)
 
+    def test_reproduction_report_writes_to_reproduce_dir(self, tmp_path):
+        """Lockfile rerun reports are written with other reproduction artifacts."""
+        mixin = self._create_mixin_with_mocks(tmp_path)
+        mixin.config._lock_data = {"fingerprints": {"w0": {}}}
+
+        with (
+            patch(
+                "srtctl.cli.mixins.postprocess_stage.collect_worker_fingerprints",
+                return_value={"w0": {}},
+            ),
+            patch(
+                "srtctl.cli.mixins.postprocess_stage.generate_reproduction_report",
+                return_value=([], ["report line"], []),
+            ),
+        ):
+            mixin._compare_against_previous_lock()
+
+        report_path = tmp_path / "reproduce" / "reproduction-report.txt"
+        assert report_path.read_text() == "report line\n"
+        assert not (tmp_path / "logs" / "reproduction-report.txt").exists()
+
 
 class TestAIAnalysisConfigSchema:
     """Tests for AIAnalysisConfig marshmallow schema."""

@@ -209,6 +209,7 @@ def show_config_details(config: SrtConfig) -> None:
     # Built-in mounts (always present at runtime)
     model_path = os.path.expandvars(config.model.path)
     mounts_table.add_row("built-in", model_path, "/model")
+    mounts_table.add_row("built-in", "<output_dir>/<job_id>", "/outputs")
     mounts_table.add_row("built-in", "<log_dir>", "/logs")
 
     if config.site and config.site.speculative_model:
@@ -469,7 +470,7 @@ def _print_running_summary(config: SrtConfig, console: Console) -> None:
         console.print('[dim]           tensorrt_llm: "1.3.0rc9"[/]')
         console.print()
         console.print(
-            "[dim italic]     Missing metadata never blocks submission; recipe.lock.yaml will infer what it can.[/]"
+            "[dim italic]     Missing metadata never blocks submission; reproduce/recipe.lock.yaml will infer what it can.[/]"
         )
 
 

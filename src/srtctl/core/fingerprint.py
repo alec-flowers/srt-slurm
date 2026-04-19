@@ -757,7 +757,7 @@ def generate_capture_script(output_path: str) -> str:
 
     Args:
         output_path: Path inside the container where fingerprint JSON is written,
-                     e.g. "/logs/fingerprint_prefill_w0.json"
+                     e.g. "/outputs/reproduce/fingerprints/fingerprint_prefill_w0.json"
 
     Returns:
         Bash command string safe for inclusion in a preamble chain.
