@@ -1,4 +1,4 @@
-name: shicheng_agg_tep8x1
+name: shicheng_agg_tep8x3
 
 model:
   path: kimi-k25-nvfp4
@@ -7,8 +7,8 @@ model:
 
 resources:
   gpu_type: gb200
-  agg_nodes: 2
-  agg_workers: 1
+  agg_nodes: 6
+  agg_workers: 3
   gpus_per_agg: 8
   gpus_per_node: 4
 
@@ -99,7 +99,7 @@ extra_mount:
   - "/lustre/fsw/coreai_dlfw_dev/karenc/models/Kimi-K2.5-Thinking-Eagle3:/speculative-model"
 
 sweep:
-  conc: [2, 4, 8, 16]
+  conc: [4, 8, 12, 16, 24, 32]  # [2, 4, 8, 16]
   
 benchmark:
   type: trace-replay
