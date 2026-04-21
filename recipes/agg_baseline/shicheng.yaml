@@ -61,11 +61,6 @@ backend:
       stream_interval: 10
       tensor_parallel_size: 8
       trust_remote_code: true
-      speculative_config:
-        decoding_type: Eagle3
-        max_draft_len: 3
-        speculative_model_dir:  /speculative-model
-        allow_advanced_sampling: true
 frontend:
   type: dynamo
   args:
@@ -96,7 +91,6 @@ observability:
 
 extra_mount:
   - "/lustre/fsw/coreai_dlfw_dev/karenc/srt-slurm/traces:/traces"
-  - "/lustre/fsw/coreai_dlfw_dev/karenc/models/Kimi-K2.5-Thinking-Eagle3:/speculative-model"
 
 sweep:
   conc: [4, 8, 12, 16, 24, 32]  # [2, 4, 8, 16]

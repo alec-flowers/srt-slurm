@@ -43,7 +43,8 @@ TSV_COLUMNS = [
     "config_name",
     "concurrency",
     "request_count",
-    "error_count",
+    "errors [pct]",
+    "runtime_error",
     "ttft_avg_ms",
     "ttft_p50_ms",
     "ttft_p99_ms",
@@ -52,10 +53,16 @@ TSV_COLUMNS = [
     "itl_p99_ms",
     "output_tput_per_user",
     "total_token_tput",
+    "total_token_tput_per_gpu",
     "request_tput",
     "goodput",
-    "total_token_tput_per_gpu",
-    "error_rate_pct",
+    "kv_total_blocks (dynamo_component_total_blocks)",
+    "kv_blocksize (dynamo_frontend_model_kv_cache_block_size)",
+    "kv_total_workspace_GiB (calculated)",
+    "kv_util_max (trtllm_kv_cache_utilization)",
+    "kv_reused_blocks (trtllm_kv_cache_reused_blocks)",
+    "kv_missed_blocks (trtllm_kv_cache_missed_blocks)",
+    "kv_hit_rate (calculated)",
 ]
 
 
@@ -131,7 +138,179 @@ def find_srtslurm_aiperf_json(job_dir: Path) -> Path | None:
     return None
 
 
-def row_from_srtslurm_job(job_dir: Path) -> Dict[str, object] | None:
+def find_server_metrics_json(job_dir: Path) -> Path | None:
+    """Find the server_metrics_export.json file for a srtslurm job."""
+    json_files = list(job_dir.glob("logs/artifacts/*/server_metrics_export.json"))
+    json_files = [f for f in json_files if "warmup" not in str(f)]
+    
+    if json_files:
+        return json_files[0]
+    return None
+
+
+def get_metric_stat_aggregated(metrics: dict, metric_name: str, stat: str, agg: str = "first") -> float | None:
+    """Extract a stat from a metric, aggregating across all series (workers).
+    
+    agg options:
+        "first" - return first series value (default)
+        "sum" - sum across all series
+        "max" - max across all series  
+        "avg" - average across all series
+    """
+    metric = metrics.get(metric_name)
+    if not metric:
+        return None
+    series = metric.get("series", [])
+    if not series:
+        return None
+    
+    values = []
+    for s in series:
+        val = s.get("stats", {}).get(stat)
+        if val is not None:
+            values.append(val)
+    
+    if not values:
+        return None
+    
+    if agg == "first":
+        return values[0]
+    elif agg == "sum":
+        return sum(values)
+    elif agg == "max":
+        return max(values)
+    elif agg == "avg":
+        return sum(values) / len(values)
+    return values[0]
+
+
+def extract_kv_cache_metrics(json_path: Path) -> Dict[str, object]:
+    """Extract KV cache metrics from server_metrics_export.json.
+    
+    Aggregates across all workers:
+    - total_blocks: average across workers (capacity is similar per worker)
+    - util_max: max across all workers (worst case utilization)
+    - reused/missed blocks: sum across workers (total cache activity)
+    - hit_rate: calculated from summed reused/(reused+missed)
+    """
+    result = {
+        "kv_total_blocks": None,
+        "kv_blocksize": None,
+        "kv_util_max": None,
+        "kv_reused_blocks": None,
+        "kv_missed_blocks": None,
+        "kv_hit_rate": None,
+    }
+    
+    if not json_path or not json_path.exists():
+        return result
+    
+    try:
+        with json_path.open() as f:
+            data = json.load(f)
+        
+        metrics = data.get("metrics", {})
+        
+        # Total blocks - average across workers (they have similar capacity)
+        result["kv_total_blocks"] = get_metric_stat_aggregated(
+            metrics, "dynamo_component_total_blocks", "avg", agg="avg"
+        )
+        
+        # Block size in tokens (constant per model)
+        result["kv_blocksize"] = get_metric_stat_aggregated(
+            metrics, "dynamo_frontend_model_kv_cache_block_size", "avg", agg="first"
+        )
+        
+        # Max utilization - take max across all workers
+        result["kv_util_max"] = get_metric_stat_aggregated(
+            metrics, "trtllm_kv_cache_utilization", "max", agg="max"
+        )
+        
+        # Cumulative counters - sum across all workers
+        result["kv_reused_blocks"] = get_metric_stat_aggregated(
+            metrics, "trtllm_kv_cache_reused_blocks", "total", agg="sum"
+        )
+        result["kv_missed_blocks"] = get_metric_stat_aggregated(
+            metrics, "trtllm_kv_cache_missed_blocks", "total", agg="sum"
+        )
+        
+        # Calculate hit rate from summed reused / (reused + missed)
+        reused = result["kv_reused_blocks"]
+        missed = result["kv_missed_blocks"]
+        if reused is not None and missed is not None:
+            total = reused + missed
+            if total > 0:
+                result["kv_hit_rate"] = reused / total
+    except Exception:
+        pass
+    
+    return result
+
+
+def calculate_kv_workspace_gib(
+    total_blocks: float | None, blocksize: float | None, cache_mb_per_1k: float
+) -> float | None:
+    """Calculate total KV cache workspace in GiB (binary).
+    
+    Formula: total_tokens = total_blocks * blocksize
+             total_1k_seqs = total_tokens / 1000
+             total_cache_GiB = (total_1k_seqs * cache_mb_per_1k) / 1024
+    """
+    if total_blocks is None or blocksize is None:
+        return None
+    total_tokens = total_blocks * blocksize
+    total_1k_seqs = total_tokens / 1000
+    total_cache_mb = total_1k_seqs * cache_mb_per_1k
+    return total_cache_mb / 1024
+
+
+def check_runtime_errors(job_dir: Path) -> str:
+    """Check worker logs for runtime errors.
+    
+    Returns:
+        "v" if no errors found, otherwise "[ErrorType (details)]"
+    """
+    import re
+    import subprocess
+    
+    logs_dir = job_dir / "logs"
+    if not logs_dir.exists():
+        return "v"
+    
+    # Search for common errors in .out files
+    error_patterns = [
+        (r"AssertionError: total_num_tokens \((\d+)\) should be less than or equal to max_num_tokens \((\d+)\)",
+         lambda m: f"[AssertionError (total_num_tokens {m.group(1)} > max_num_tokens {m.group(2)})]"),
+        (r"AssertionError: (.{1,50})",
+         lambda m: f"[AssertionError ({m.group(1).strip()})]"),
+        (r"torch\.AcceleratorError: CUDA error: (.{1,50})",
+         lambda m: f"[CUDA error ({m.group(1).strip()})]"),
+        (r"RuntimeError: (.{1,50})",
+         lambda m: f"[RuntimeError ({m.group(1).strip()})]"),
+        (r"OutOfMemoryError|out of memory|OOM",
+         lambda m: "[OOM]"),
+    ]
+    
+    try:
+        # Read all .out files
+        for out_file in logs_dir.glob("*.out"):
+            if out_file.name == "benchmark.out":
+                continue
+            try:
+                content = out_file.read_text(errors="ignore")
+                for pattern, formatter in error_patterns:
+                    match = re.search(pattern, content)
+                    if match:
+                        return formatter(match)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    
+    return "v"
+
+
+def row_from_srtslurm_job(job_dir: Path, cache_mb_per_1k: float = 34.31) -> Dict[str, object] | None:
     """Extract a row of stats from a srtslurm job directory."""
     json_path = find_srtslurm_aiperf_json(job_dir)
     if not json_path:
@@ -139,6 +318,10 @@ def row_from_srtslurm_job(job_dir: Path) -> Dict[str, object] | None:
         return None
     
     info = extract_srtslurm_info(job_dir)
+    
+    # Extract KV cache metrics from server_metrics_export.json
+    server_metrics_path = find_server_metrics_json(job_dir)
+    kv_metrics = extract_kv_cache_metrics(server_metrics_path)
     
     with json_path.open() as f:
         data = json.load(f)
@@ -167,13 +350,21 @@ def row_from_srtslurm_job(job_dir: Path) -> Dict[str, object] | None:
         if total > 0:
             error_rate_pct = (error_count / total) * 100
     
+    # Combined error field: "count [pct%]"
+    error_count_int = int(error_count) if error_count else 0
+    errors_combined = f"{error_count_int} [{error_rate_pct:.1f}%]"
+    
+    # Check for runtime errors in worker logs
+    runtime_error = check_runtime_errors(job_dir)
+    
     return {
         "dataset": info["dataset"],
         "srtslurm_id": info["srtslurm_id"],
         "config_name": info["config_name"],
         "concurrency": info["concurrency"],
         "request_count": request_count,
-        "error_count": error_count,
+        "errors [pct]": errors_combined,
+        "runtime_error": runtime_error,
         "ttft_avg_ms": parse_float(ttft.get("avg")),
         "ttft_p50_ms": parse_float(ttft.get("p50")),
         "ttft_p99_ms": parse_float(ttft.get("p99")),
@@ -185,7 +376,15 @@ def row_from_srtslurm_job(job_dir: Path) -> Dict[str, object] | None:
         "request_tput": request_tput,
         "goodput": goodput,
         "total_token_tput_per_gpu": total_token_tput_per_gpu,
-        "error_rate_pct": error_rate_pct,
+        "kv_total_blocks (dynamo_component_total_blocks)": kv_metrics["kv_total_blocks"],
+        "kv_blocksize (dynamo_frontend_model_kv_cache_block_size)": kv_metrics["kv_blocksize"],
+        "kv_total_workspace_GiB (calculated)": calculate_kv_workspace_gib(
+            kv_metrics["kv_total_blocks"], kv_metrics["kv_blocksize"], cache_mb_per_1k
+        ),
+        "kv_util_max (trtllm_kv_cache_utilization)": kv_metrics["kv_util_max"],
+        "kv_reused_blocks (trtllm_kv_cache_reused_blocks)": kv_metrics["kv_reused_blocks"],
+        "kv_missed_blocks (trtllm_kv_cache_missed_blocks)": kv_metrics["kv_missed_blocks"],
+        "kv_hit_rate (calculated)": kv_metrics["kv_hit_rate"],
     }
 
 
@@ -463,15 +662,22 @@ def main() -> int:
         default=str(SRTSLURM_OUTPUTS_DIR),
         help=f"srtslurm outputs directory (default: {SRTSLURM_OUTPUTS_DIR})"
     )
+    parser.add_argument(
+        "--cache-mb-per-1k",
+        type=float,
+        default=34.31,
+        help="KV cache size in MB per 1K sequence length (default: 34.31 for Kimi-K2)"
+    )
     args = parser.parse_args()
 
     # Determine delimiter
     delimiter = "," if args.csv else "\t"
 
-    # Handle --header
+    # Handle --header (print header, then continue if --dir is also specified)
     if args.header:
         print_tsv_header(delimiter)
-        return 0
+        if not args.job_ids and not args.paths:
+            return 0
 
     # Collect rows from job IDs
     srtslurm_rows: List[Dict[str, object]] = []
@@ -480,7 +686,7 @@ def main() -> int:
         for job_id in args.job_ids:
             job_dir = find_srtslurm_job_dir(job_id, outputs_dir)
             if job_dir:
-                row = row_from_srtslurm_job(job_dir)
+                row = row_from_srtslurm_job(job_dir, cache_mb_per_1k=args.cache_mb_per_1k)
                 if row:
                     srtslurm_rows.append(row)
             else:
