@@ -2,7 +2,7 @@ name: shicheng_agg_tep8x3
 
 model:
   path: kimi-k25-nvfp4
-  container: dyn-101-trtllm-rc11-condp-alec
+  container: dyn-110-trtllm-rc13-kvscheduler-fix-condp-branch
   precision: fp4
 
 resources:
@@ -76,7 +76,6 @@ frontend:
   enable_multiple_frontends: false
   env:
     OTEL_SERVICE_NAME: "dynamo-frontend-shicheng-conc{conc}"
-    DYN_LOG: "info,dynamo_kv_router=debug,dynamo_llm::kv_router=debug"
 
 health_check:
   max_attempts: 500
@@ -98,21 +97,23 @@ extra_mount:
   - "/lustre/fsw/coreai_dlfw_dev/karenc/models/Kimi-K2.5-Thinking-Eagle3:/speculative-model"
 
 sweep:
-  conc: [4, 8, 16, 24, 32]
+  conc: [8, 12, 16, 24, 32, 64]
 
 benchmark:
   type: trace-replay
   trace_file: /traces/kv-reuse-difficult_200k-fix/dataset.jsonl
   concurrencies: "{conc}"
   ttft_threshold_ms: 5000
-  itl_threshold_ms: 7
+  itl_threshold_ms: 10
   aiperf_package: "aiperf>=0.7.0"
   aiperf_args:
-    benchmark-duration: 600
+    benchmark-duration: 900
     benchmark-grace-period: 60
     request-timeout-seconds: 1200
     workers-max: 200
     record-processors: 8
     profile-export-level: raw
-    concurrency-ramp-duration: 20
+    concurrency-ramp-duration: 60 
     export-http-trace: true
+    
+

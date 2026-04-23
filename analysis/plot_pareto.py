@@ -416,6 +416,10 @@ def main():
     ax.set_ylabel("Total Output Tokens/s/GPU (higher = better throughput)", fontsize=12)
     ax.set_title(args.title, fontsize=14)
     ax.legend(loc="best", fontsize=9, title_fontsize=10)
+    if args.label_points:
+        ax.annotate("point labels: (concurrency, p50 TTFT ms)", xy=(1, 1), xycoords="axes fraction",
+                    xytext=(-5, -5), textcoords="offset points", ha="right", va="top", fontsize=8,
+                    color="gray", style="italic")
     ax.grid(True, alpha=0.3)
     
     plt.tight_layout()

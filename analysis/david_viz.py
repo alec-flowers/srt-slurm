@@ -33,8 +33,9 @@ METRIC_TOTAL_TOKEN_TPUT = "Total Token Throughput (tokens/sec)"
 METRIC_REQUEST_TPUT = "Request Throughput (requests/sec)"
 METRIC_REQUEST_COUNT = "Request Count"
 METRIC_ERROR_REQUEST_COUNT = "Error Request Count"
-SLA_TTFT_MS = 3000.0
-SLA_ITL_MS = 8.0
+SLA_TTFT_MS = 5000.0
+SLA_ITL_MS = 7.0
+GOODPUT_COL = f"goodput [{int(SLA_TTFT_MS)}/{int(SLA_ITL_MS)}]"
 
 # Columns for TSV/Excel output
 TSV_COLUMNS = [
@@ -55,7 +56,7 @@ TSV_COLUMNS = [
     "total_token_tput",
     "total_token_tput_per_gpu",
     "request_tput",
-    "goodput",
+    GOODPUT_COL,
     "kv_total_blocks (dynamo_component_total_blocks)",
     "kv_blocksize (dynamo_frontend_model_kv_cache_block_size)",
     "kv_total_workspace_GiB (calculated)",
@@ -347,25 +348,31 @@ def row_from_srtslurm_job(job_dir: Path, cache_mb_per_1k: float = 34.31) -> Dict
     request_tput = parse_float(data.get("request_throughput", {}).get("avg"))
     goodput = parse_float(data.get("goodput", {}).get("avg"))
     output_tput_per_user = parse_float(data.get("output_token_throughput_per_user", {}).get("avg"))
-    
+
+    # Read SLA thresholds from aiperf JSON, fall back to module-level constants
+    goodput_thresholds = data.get("input_config", {}).get("input", {}).get("goodput", {})
+    ttft_sla = goodput_thresholds.get("time_to_first_token", SLA_TTFT_MS)
+    itl_sla = goodput_thresholds.get("inter_token_latency", SLA_ITL_MS)
+    goodput_col = f"goodput [{int(ttft_sla)}/{int(itl_sla)}]"
+
     # Calculate derived metrics
     total_token_tput_per_gpu = None
     if total_token_tput and info["gpus"]:
         total_token_tput_per_gpu = total_token_tput / info["gpus"]
-    
+
     error_rate_pct = 0.0
     if request_count:
         total = request_count + error_count
         if total > 0:
             error_rate_pct = (error_count / total) * 100
-    
+
     # Combined error field: "count [pct%]"
     error_count_int = int(error_count) if error_count else 0
     errors_combined = f"{error_count_int} [{error_rate_pct:.1f}%]"
-    
+
     # Check for runtime errors in worker logs
     runtime_error = check_runtime_errors(job_dir)
-    
+
     return {
         "dataset": info["dataset"],
         "srtslurm_id": info["srtslurm_id"],
@@ -383,7 +390,7 @@ def row_from_srtslurm_job(job_dir: Path, cache_mb_per_1k: float = 34.31) -> Dict
         "output_tput_per_user": output_tput_per_user,
         "total_token_tput": total_token_tput,
         "request_tput": request_tput,
-        "goodput": goodput,
+        goodput_col: goodput,
         "total_token_tput_per_gpu": total_token_tput_per_gpu,
         "kv_total_blocks (dynamo_component_total_blocks)": kv_metrics["kv_total_blocks"],
         "kv_blocksize (dynamo_frontend_model_kv_cache_block_size)": kv_metrics["kv_blocksize"],
@@ -619,14 +626,22 @@ def format_tsv_value(val) -> str:
     return str(val)
 
 
-def print_tsv_header(delimiter: str = "\t") -> None:
+def _resolve_columns(row: Dict[str, object]) -> List[str]:
+    """Resolve TSV_COLUMNS, replacing GOODPUT_COL with the actual key from the row."""
+    actual_goodput_col = next((k for k in row if k.startswith("goodput [")), GOODPUT_COL)
+    return [actual_goodput_col if col == GOODPUT_COL else col for col in TSV_COLUMNS]
+
+
+def print_tsv_header(delimiter: str = "\t", row: Dict[str, object] | None = None) -> None:
     """Print header row."""
-    print(delimiter.join(TSV_COLUMNS))
+    cols = _resolve_columns(row) if row else TSV_COLUMNS
+    print(delimiter.join(cols))
 
 
 def print_tsv_row(row: Dict[str, object], delimiter: str = "\t") -> None:
     """Print a single row."""
-    values = [format_tsv_value(row.get(col)) for col in TSV_COLUMNS]
+    cols = _resolve_columns(row)
+    values = [format_tsv_value(row.get(col)) for col in cols]
     print(delimiter.join(values))
 
 
@@ -682,11 +697,10 @@ def main() -> int:
     # Determine delimiter
     delimiter = "," if args.csv else "\t"
 
-    # Handle --header (print header, then continue if --dir is also specified)
-    if args.header:
+    # Handle --header with no data sources: print header and exit
+    if args.header and not args.job_ids and not args.paths:
         print_tsv_header(delimiter)
-        if not args.job_ids and not args.paths:
-            return 0
+        return 0
 
     # Collect rows from job IDs
     srtslurm_rows: List[Dict[str, object]] = []
@@ -716,6 +730,8 @@ def main() -> int:
 
     if args.tsv or args.job_ids or args.csv:
         # TSV/CSV output mode (default for --dir)
+        if args.header:
+            print_tsv_header(delimiter, row=all_rows[0])
         for row in all_rows:
             print_tsv_row(row, delimiter)
     else:
