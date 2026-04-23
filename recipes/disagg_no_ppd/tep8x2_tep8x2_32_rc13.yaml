@@ -1,7 +1,7 @@
 name: tep8x2p_tep8x2d_200k_trace
 model:
   path: kimi-k25-nvfp4
-  container: dyn-101-trtllm-rc11-condp-alec 
+  container: dyn-110-trtllm-rc13-kvscheduler-fix-condp-branch
   precision: fp4
 
 resources:
@@ -73,7 +73,6 @@ backend:
         max_tokens_in_buffer: 0
         kv_transfer_sender_future_timeout_ms: 30000
       max_num_tokens: 640
-      enable_chunked_prefill: true
       # disable_overlap_scheduler: true
       cuda_graph_config:
         batch_sizes:
@@ -90,7 +89,7 @@ backend:
       kv_cache_config:
         dtype: fp8
         enable_block_reuse: true
-        free_gpu_memory_fraction: 0.75
+        free_gpu_memory_fraction: 0.85
         tokens_per_block: 32
       max_batch_size: 128
       moe_config:
@@ -154,7 +153,7 @@ benchmark:
   trace_file: /traces/kv-reuse-difficult_200k-fix/dataset.jsonl
   concurrencies: "{conc}"  
   ttft_threshold_ms: 5000
-  itl_threshold_ms: 7
+  itl_threshold_ms: 10
   aiperf_package: "aiperf>=0.7.0"
   aiperf_args:
     benchmark-duration: 900
