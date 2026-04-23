@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -129,11 +130,12 @@ def extract_metrics(job_dir: Path) -> Dict[str, object] | None:
     
     output_tput_per_user = data.get("output_token_throughput_per_user", {}).get("avg")
     total_token_tput = data.get("total_token_throughput", {}).get("avg")
-    
+    ttft_p50 = data.get("time_to_first_token", {}).get("p50")
+
     total_token_tput_per_gpu = None
     if total_token_tput and gpus:
         total_token_tput_per_gpu = total_token_tput / gpus
-    
+
     return {
         "job_id": job_dir.name.split("_")[0],
         "config_name": config_name,
@@ -141,8 +143,21 @@ def extract_metrics(job_dir: Path) -> Dict[str, object] | None:
         "output_tput_per_user": output_tput_per_user,
         "total_token_tput": total_token_tput,
         "total_token_tput_per_gpu": total_token_tput_per_gpu,
+        "ttft_p50": ttft_p50,
         "gpus": gpus,
     }
+
+
+def fmt_2sf(value: float | None) -> str:
+    """Format a value to 2 significant figures."""
+    if value is None:
+        return "?"
+    if value == 0:
+        return "0"
+    mag = math.floor(math.log10(abs(value)))
+    factor = 10 ** (mag - 1)
+    rounded = round(value / factor) * factor
+    return str(int(rounded))
 
 
 def compute_pareto_frontier(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
@@ -251,6 +266,7 @@ def load_series_data_from_dict(dict_path: Path) -> Dict:
             "points": [tuple(p) for p in series_info["points"]],
             "labels": series_info["labels"],
             "job_ids": series_info.get("job_ids", []),
+            "ttft_p50_ms": series_info.get("ttft_p50_ms", []),
         }
     return series_data
 
@@ -276,6 +292,7 @@ def export_series_data_to_dict(series_data: Dict, dict_path: Path) -> None:
                 "points": [list(p) for p in info["points"]],
                 "labels": info["labels"],
                 "job_ids": info.get("job_ids", []),
+                "ttft_p50_ms": info.get("ttft_p50_ms", []),
             }
             for name, info in series_data.items()
         }
@@ -293,6 +310,7 @@ def collect_series_data(series_list: List[Tuple[str, List[str]]], outputs_dir: P
         points = []
         labels = []
         valid_job_ids = []
+        ttft_p50_ms = []
         for job_id in job_ids:
             job_dir = find_srtslurm_job_dir(job_id, outputs_dir)
             if not job_dir:
@@ -314,9 +332,10 @@ def collect_series_data(series_list: List[Tuple[str, List[str]]], outputs_dir: P
             points.append((x, y))
             labels.append(f"c{metrics.get('concurrency', '?')}")
             valid_job_ids.append(job_id)
-        
+            ttft_p50_ms.append(metrics.get("ttft_p50"))
+
         if points:
-            series_data[series_name] = {"points": points, "labels": labels, "job_ids": valid_job_ids}
+            series_data[series_name] = {"points": points, "labels": labels, "job_ids": valid_job_ids, "ttft_p50_ms": ttft_p50_ms}
     
     return series_data
 
@@ -384,8 +403,14 @@ def main():
         
         # Label points
         if args.label_points:
-            for (x, y), label in zip(points, labels):
-                ax.annotate(label, (x, y), textcoords="offset points", xytext=(5, 5), fontsize=8)
+            ttft_p50_ms = data.get("ttft_p50_ms", [])
+            for idx, ((x, y), label) in enumerate(zip(points, labels)):
+                ttft = ttft_p50_ms[idx] if idx < len(ttft_p50_ms) else None
+                if ttft is not None:
+                    point_label = f"({label}, {fmt_2sf(ttft)})"
+                else:
+                    point_label = label
+                ax.annotate(point_label, (x, y), textcoords="offset points", xytext=(5, 5), fontsize=8)
     
     ax.set_xlabel("Output Tokens/s/User (higher = better latency)", fontsize=12)
     ax.set_ylabel("Total Output Tokens/s/GPU (higher = better throughput)", fontsize=12)
