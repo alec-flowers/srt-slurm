@@ -118,9 +118,18 @@ def extract_srtslurm_info(job_dir: Path) -> Dict[str, object]:
                     info["dataset"] = Path(trace_file).parent.name
                 # Calculate GPUs from resources
                 resources = config.get("resources", {})
-                agg_workers = resources.get("agg_workers", 1)
-                gpus_per_agg = resources.get("gpus_per_agg", 8)
-                info["gpus"] = agg_workers * gpus_per_agg
+                agg_workers = resources.get("agg_workers")
+                gpus_per_agg = resources.get("gpus_per_agg")
+                if agg_workers and gpus_per_agg:
+                    info["gpus"] = agg_workers * gpus_per_agg
+                else:
+                    prefill_workers = resources.get("prefill_workers") or 0
+                    gpus_per_prefill = resources.get("gpus_per_prefill") or 0
+                    decode_workers = resources.get("decode_workers") or 0
+                    gpus_per_decode = resources.get("gpus_per_decode") or 0
+                    total = prefill_workers * gpus_per_prefill + decode_workers * gpus_per_decode
+                    if total > 0:
+                        info["gpus"] = total
         except Exception:
             pass
     
