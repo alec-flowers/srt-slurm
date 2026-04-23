@@ -97,7 +97,7 @@ extra_mount:
   - "/lustre/fsw/coreai_dlfw_dev/karenc/models/Kimi-K2.5-Thinking-Eagle3:/speculative-model"
 
 sweep:
-  conc: [8, 12, 16, 24, 32, 64]
+  conc: [128, 256] #[8, 12, 16, 24, 32, 64]
 
 benchmark:
   type: trace-replay
