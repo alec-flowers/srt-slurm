@@ -1,4 +1,4 @@
-name: dep4x4p_tep4x2d_200k_trace
+name: dep4x2p_tep4x4d_condp_200k_trace
 model:
   path: kimi-k25-nvfp4
   container: dyn-110-trtllm-rc13-kvscheduler-fix-condp-branch
@@ -6,11 +6,11 @@ model:
 
 resources:
   gpu_type: gb200
-  prefill_nodes: 4
-  prefill_workers: 4
+  prefill_nodes: 2
+  prefill_workers: 2
   gpus_per_prefill: 4
-  decode_nodes: 2
-  decode_workers: 2
+  decode_nodes: 4
+  decode_workers: 4
   gpus_per_decode: 4
   gpus_per_node: 4
 backend:
@@ -119,6 +119,9 @@ frontend:
     active-prefill-tokens-threshold: 1000000000
     active-decode-blocks-threshold: 100
     active-prefill-tokens-threshold-frac: 100
+    router-conditional-prefill: true
+    router-conditional-prefill-max-new-tokens: "{condp}"
+    
   enable_multiple_frontends: false
   env:
     OTEL_SERVICE_NAME: "dynamo-frontend-conc{conc}"
@@ -140,6 +143,7 @@ observability:
 
 sweep:
   conc: [8, 12, 16, 24, 32, 64]
+  condp: [1024, 2048]
 
 extra_mount:
   - "/lustre/fsw/coreai_dlfw_dev/karenc/srt-slurm/traces:/traces"
