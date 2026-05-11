@@ -1,4 +1,4 @@
-name: shicheng_agg_tep8x3
+name: onehour_agg_eagle_kv_routing_conc24
 
 model:
   path: kimi-k25-nvfp4
@@ -12,13 +12,16 @@ resources:
   gpus_per_agg: 8
   gpus_per_node: 4
 
+slurm:
+  time_limit: "01:45:00"
+
 backend:
   type: trtllm
   aggregated_environment:
     NCCL_GRAPH_MIXING_SUPPORT: "0"
     TRTLLM_ENABLE_PDL: "1"
     TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS: "2"
-    OTEL_SERVICE_NAME: "dynamo-agg-shicheng-conc{conc}"
+    OTEL_SERVICE_NAME: "dynamo-agg-onehour-eagle-kv-conc24"
     DYN_REASONING_PARSER: kimi_k25
     DYN_TOOL_CALL_PARSER: kimi_k2
   trtllm_config:
@@ -75,7 +78,7 @@ frontend:
     active-prefill-tokens-threshold-frac: 100
   enable_multiple_frontends: false
   env:
-    OTEL_SERVICE_NAME: "dynamo-frontend-shicheng-conc{conc}"
+    OTEL_SERVICE_NAME: "dynamo-frontend-onehour-eagle-kv-conc24"
 
 health_check:
   max_attempts: 500
@@ -93,27 +96,22 @@ observability:
   otel_endpoint: "http://10.57.209.4:4317"
 
 extra_mount:
-  - "/lustre/fsw/coreai_dlfw_dev/karenc/srt-slurm/traces:/traces"
-  - "/lustre/fsw/coreai_dlfw_dev/karenc/models/Kimi-K2.5-Thinking-Eagle3:/speculative-model"
-
-sweep:
-  conc: [128, 256] #[8, 12, 16, 24, 32, 64]
+  - "/lustre/fsw/coreai_tritoninference_triton3/aflowers/traces:/traces"
+  - "/lustre/fsw/coreai_tritoninference_triton3/aflowers/models/Kimi-K2.5-Thinking-Eagle3:/speculative-model"
 
 benchmark:
   type: trace-replay
-  trace_file: /traces/kv-reuse-difficult_200k-fix/dataset.jsonl
-  concurrencies: "{conc}"
+  trace_file: /traces/kv-reuse-difficult_200k-fixed/dataset.jsonl
+  concurrencies: "24"
   ttft_threshold_ms: 5000
   itl_threshold_ms: 10
   aiperf_package: "aiperf>=0.7.0"
   aiperf_args:
-    benchmark-duration: 900
+    benchmark-duration: 3600
     benchmark-grace-period: 60
     request-timeout-seconds: 1200
     workers-max: 200
     record-processors: 8
     profile-export-level: raw
-    concurrency-ramp-duration: 60 
+    concurrency-ramp-duration: 60
     export-http-trace: true
-    
-
